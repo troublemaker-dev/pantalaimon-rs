@@ -1,0 +1,26 @@
+# systemd user service for running pantalaimon natively (Linux with D-Bus).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp pantalaimon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pantalaimon
+#
+# panctl is available directly once the service is running.
+
+[Unit]
+Description=Pantalaimon E2E Matrix reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pantalaimon \
+    -c %h/.config/pantalaimon/pantalaimon.conf \
+    --data-path %h/.local/share/pantalaimon
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=pantalaimon=info
+
+[Install]
+WantedBy=default.target

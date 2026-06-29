@@ -1,0 +1,52 @@
+[package]
+name = "pantalaimon"
+version = "0.11.0"
+edition = "2021"
+description = "E2E encryption-aware Matrix reverse proxy daemon"
+license = "Apache-2.0"
+
+[[bin]]
+name = "pantalaimon"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable D-Bus UI (requires a running D-Bus session bus)
+ui = ["dep:zbus"]
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+rusqlite = { workspace = true }
+keyring = { workspace = true }
+configparser = { workspace = true }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+dirs = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+indexmap = { workspace = true }
+
+zbus = { version = "4", default-features = false, features = ["tokio"], optional = true }
+
+matrix-sdk-crypto = { workspace = true }
+matrix-sdk-sqlite = { workspace = true }
+ruma = { workspace = true }
+
+[build-dependencies]
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tower = { version = "0.4", features = ["util"] }

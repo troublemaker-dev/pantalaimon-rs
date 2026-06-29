@@ -1,0 +1,35 @@
+# Podman Quadlet unit for running pantalaimon in a container.
+# Requires Podman 4.4+ (available in Fedora 38+, RHEL 9.3+, Debian trixie+).
+#
+# Install:
+#   mkdir -p ~/.config/containers/systemd
+#   cp pantalaimon.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start pantalaimon
+#
+# Use panctl inside the running container:
+#   podman exec -it pantalaimon panctl <command>
+#
+# The image name must match what was used in `podman build -t <name> .`.
+# Adjust PublishPort entries to match your pantalaimon.conf ListenPort values.
+
+[Unit]
+Description=Pantalaimon E2E Matrix reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/pantalaimon
+ContainerName=pantalaimon
+PublishPort=8009:8009
+Volume=%h/.local/share/pantalaimon:/data:z
+Volume=%h/.config/pantalaimon:/config:z
+Environment=RUST_LOG=pantalaimon=info
+Exec=-c /config/pantalaimon.conf --data-path /data
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

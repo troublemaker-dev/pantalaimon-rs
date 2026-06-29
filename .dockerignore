@@ -1,0 +1,27 @@
+# Rust build artifacts (large, not needed in build context)
+target/
+
+# Python package tree from the original repo
+pantalaimon/
+*.egg-info/
+dist/
+__pycache__/
+.tox/
+.mypy_cache/
+
+# Python project files
+setup.py
+MANIFEST.in
+tox.ini
+test-requirements.txt
+
+# Tests
+tests/
+
+# Git history
+.git/
+.gitignore
+
+# Documentation (not needed to build binaries)
+docs/
+*.md
