@@ -412,7 +412,20 @@ pub async fn send_message(
                                 .unwrap());
                         }
                         Ok(crate::client::SendOutcome::NotEncrypted) => {}
-                        Err(e) => warn!(%room_id, "Encryption error, sending plaintext: {e}"),
+                        Err(e) => {
+                            warn!(%room_id, "Encryption error, refusing to send: {e}");
+                            return Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header("content-type", "application/json")
+                                .body(Body::from(
+                                    serde_json::json!({
+                                        "errcode": "M_UNKNOWN",
+                                        "error": format!("Failed to encrypt event: {e}"),
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap());
+                        }
                     }
                 }
                 Err(e) => debug!(%room_id, "Could not parse send body: {e}"),

@@ -55,6 +55,10 @@ use crate::{
     store::PanStore,
 };
 
+/// How long to hold an outgoing send open while waiting for a manual
+/// send-anyways/cancel-sending decision on a room with unverified devices.
+const UNVERIFIED_SEND_TIMEOUT_SECS: u64 = 120;
+
 /// Outcome of `prepare_and_encrypt`.
 pub enum SendOutcome {
     /// Room is not E2E-encrypted; caller should forward the original body.
@@ -471,7 +475,7 @@ impl PanClient {
             self.pending_sends.insert(room_id.to_owned(), tx);
 
             let proceed = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(UNVERIFIED_SEND_TIMEOUT_SECS),
                 rx,
             )
             .await

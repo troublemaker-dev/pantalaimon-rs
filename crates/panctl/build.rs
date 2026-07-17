@@ -98,6 +98,15 @@ fn panctl_command() -> Command {
                 .about("Reject a pending key-share request")
                 .args(user_args()),
         )
+        .subcommand(
+            Command::new("watch")
+                .about("Watch for daemon events in real time (unverified-device blocks, SAS invites, etc.)")
+                .arg(
+                    Arg::new("pan_user")
+                        .long("pan-user")
+                        .help("Only show events for this pantalaimon user (@alice:matrix.org)"),
+                ),
+        )
 }
 
 fn main() {
