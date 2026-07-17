@@ -6,14 +6,14 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
     AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, DecryptionSettings,
-    EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine,
-    Sas, TrustRequirement,
+    EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, MegolmError,
+    OlmMachine, Sas, TrustRequirement,
     decrypt_room_key_export, encrypt_room_key_export,
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
     types::{
         events::room::encrypted::EncryptedEvent,
         requests::{
-            AnyIncomingResponse, AnyOutgoingRequest, OutgoingVerificationRequest,
+            AnyIncomingResponse, AnyOutgoingRequest, OutgoingRequest, OutgoingVerificationRequest,
             RoomMessageRequest, ToDeviceRequest,
         },
     },
@@ -42,7 +42,7 @@ use ruma::{
         },
     },
     serde::Raw,
-    EventId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
+    EventId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
 };
 use serde::Deserialize;
 use serde_json::{json, value::to_raw_value, Value};
@@ -134,6 +134,9 @@ pub struct PanClient {
     notified_done: DashMap<String, ()>,
     /// Room sends pending a user decision (room_id → oneshot, true=proceed/false=cancel).
     pending_sends: DashMap<String, oneshot::Sender<bool>>,
+    /// Events queued for a room-key re-request after a MissingRoomKey decrypt
+    /// failure during `process_sync`; flushed in `run_post_sync_tasks`.
+    missing_room_keys: std::sync::Mutex<Vec<(OwnedRoomId, Raw<EncryptedEvent>)>>,
 }
 
 impl PanClient {
@@ -194,6 +197,7 @@ impl PanClient {
             notified_show: DashMap::new(),
             notified_done: DashMap::new(),
             pending_sends: DashMap::new(),
+            missing_room_keys: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -368,7 +372,15 @@ impl PanClient {
                         }
                         Err(e) => warn!("serialize decrypted event: {e}"),
                     },
-                    Err(e) => debug!("decrypt {room_id_str}: {e}"),
+                    Err(e) => {
+                        debug!("decrypt {room_id_str}: {e}");
+                        if matches!(e, MegolmError::MissingRoomKey(_)) {
+                            self.missing_room_keys
+                                .lock()
+                                .unwrap()
+                                .push((room_id.clone(), raw_event.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -393,11 +405,20 @@ impl PanClient {
         let decryption_settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
         };
-        let decrypted = self
+        let decrypted = match self
             .olm
             .decrypt_room_event(&raw_event, &room_id, &decryption_settings)
             .await
-            .ok()?;
+        {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("decrypt {room_id}: {e}");
+                if matches!(e, MegolmError::MissingRoomKey(_)) {
+                    self.request_and_send_room_key(&raw_event, &room_id).await;
+                }
+                return None;
+            }
+        };
         let mut cleartext = serde_json::to_value(&decrypted.event).ok()?;
         for field in ["event_id", "origin_server_ts", "sender", "room_id", "unsigned"] {
             if let Some(val) = event.get(field) {
@@ -576,9 +597,50 @@ impl PanClient {
     /// Called from the sync handler in a spawned task so the sync response
     /// is returned to the client before any homeserver round-trips happen.
     pub async fn run_post_sync_tasks(self: std::sync::Arc<Self>) {
+        self.flush_missing_room_key_requests().await;
         self.process_outgoing_requests().await;
         self.check_pending_requests().await;
         self.check_sas_states().await;
+    }
+
+    /// Drain room-key re-requests queued by the last `process_sync` decrypt
+    /// pass (see `missing_room_keys`) and send them out.
+    async fn flush_missing_room_key_requests(&self) {
+        let pending: Vec<_> = std::mem::take(&mut *self.missing_room_keys.lock().unwrap());
+        for (room_id, raw_event) in pending {
+            self.request_and_send_room_key(&raw_event, &room_id).await;
+        }
+    }
+
+    /// Ask other devices for the Megolm session used to encrypt `raw_event`,
+    /// sending the resulting to-device request(s) immediately.
+    async fn request_and_send_room_key(&self, raw_event: &Raw<EncryptedEvent>, room_id: &RoomId) {
+        let (cancel, request) = match self.olm.request_room_key(raw_event, room_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("request_room_key for {room_id}: {e}");
+                return;
+            }
+        };
+        if let Some(cancel) = &cancel {
+            self.send_key_request(cancel).await;
+        }
+        self.send_key_request(&request).await;
+    }
+
+    async fn send_key_request(&self, req: &OutgoingRequest) {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        match req.request() {
+            AnyOutgoingRequest::ToDeviceRequest(r) => {
+                if let Err(e) = self
+                    .send_to_device(base, &self.access_token, r, req.request_id())
+                    .await
+                {
+                    warn!("room key request to-device: {e}");
+                }
+            }
+            _ => warn!("unexpected outgoing request type from request_room_key"),
+        }
     }
 
     // -----------------------------------------------------------------------
