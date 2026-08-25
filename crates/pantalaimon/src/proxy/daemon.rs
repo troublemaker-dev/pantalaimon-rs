@@ -108,6 +108,16 @@ impl ProxyDaemon {
         self.pan_clients.insert(user_id, client);
     }
 
+    /// Drop a registered `PanClient` (e.g. on logout) — removes both its
+    /// `user_id → client` entry and its `access_token → user_id`
+    /// reverse-lookup, and returns the removed client so the caller can
+    /// clean up its on-disk state.
+    pub fn remove_client(&self, user_id: &str) -> Option<Arc<PanClient>> {
+        let (_, client) = self.pan_clients.remove(user_id)?;
+        self.token_to_user.remove(&client.access_token);
+        Some(client)
+    }
+
     /// Return true if `token` belongs to a user we already track.
     pub fn is_known_token(&self, token: &str) -> bool {
         self.token_to_user.contains_key(token)

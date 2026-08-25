@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use matrix_sdk_crypto::{
     AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, DecryptionSettings,
     EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, MegolmError,
-    OlmMachine, Sas, TrustRequirement,
+    OlmMachine, Sas, TrustRequirement, UserDevices,
     decrypt_room_key_export, encrypt_room_key_export,
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
     types::{
@@ -67,6 +67,18 @@ pub enum SendOutcome {
     Encrypted { event_type: String, content: Value },
     /// User (or timeout) cancelled the send; caller should return 403.
     Cancelled,
+}
+
+/// Directory holding a `(user_id, device_id)` session's crypto store
+/// (`matrix-sdk-crypto.sqlite3` lives inside it). Shared between
+/// `PanClient::new`, which opens it, and logout handling, which deletes it.
+pub fn crypto_store_dir(data_dir: &Path, user_id: &str, device_id: &str) -> PathBuf {
+    let sanitized_uid = user_id.trim_start_matches('@').replace(':', "_");
+    let sanitized_did = device_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect::<String>();
+    data_dir.join(format!("crypto-{}_{}", sanitized_uid, sanitized_did))
 }
 
 /// Delete all but the most recently inserted inbound group session per
@@ -161,12 +173,7 @@ impl PanClient {
         // SqliteCryptoStore::open takes a directory; it creates
         // matrix-sdk-crypto.sqlite3 inside it.  Include device_id so that
         // multiple sessions for the same user each get their own store.
-        let sanitized_uid = user_id.trim_start_matches('@').replace(':', "_");
-        let sanitized_did = device_id
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-            .collect::<String>();
-        let crypto_db = data_dir.join(format!("crypto-{}_{}", sanitized_uid, sanitized_did));
+        let crypto_db = crypto_store_dir(data_dir, &user_id, &device_id);
 
         // Drop old inbound Megolm sessions before opening the store (no concurrent access).
         // The actual SQLite file is matrix-sdk-crypto.sqlite3 inside the crypto_db directory.
@@ -441,6 +448,18 @@ impl PanClient {
     /// If the room is known to be E2E-encrypted, claims any missing OTKs,
     /// shares the room key, and returns `("m.room.encrypted", encrypted_json)`.
     /// Otherwise returns the original `(event_type, content)` unchanged.
+    /// Make sure `olm` is tracking `users` and has a fresh `/keys/query` for
+    /// any of them it doesn't yet know about, flushing that query
+    /// synchronously so callers immediately see up-to-date device lists.
+    async fn ensure_devices_tracked(&self, users: &[OwnedUserId]) -> Result<()> {
+        self.olm
+            .update_tracked_users(users.iter().map(AsRef::as_ref))
+            .await
+            .context("update_tracked_users")?;
+        self.process_outgoing_requests().await;
+        Ok(())
+    }
+
     pub async fn prepare_and_encrypt(
         &self,
         room_id: &str,
@@ -456,6 +475,12 @@ impl PanClient {
 
         let ruma_room_id = RoomId::parse(room_id)?;
         let users = self.get_room_member_ids(&ruma_room_id).await?;
+
+        // OlmMachine never queries a user's keys on its own — without this,
+        // share_room_key/get_missing_sessions below silently operate on
+        // whatever's already cached (nothing, for a user we've never sent
+        // to), so the room key never reaches devices we haven't tracked.
+        self.ensure_devices_tracked(&users).await?;
 
         // Block if any room member has unverified devices (unless config says ignore)
         if !self.server_conf.ignore_verification && self.has_unverified_devices(&users).await {
@@ -540,6 +565,59 @@ impl PanClient {
         })
     }
 
+    /// Trust-on-first-use: the first time we ever see a device for
+    /// `user_id`, mark it locally verified and remember its Ed25519 key.
+    /// A device we've never recorded that shows up *after* we've already
+    /// established a baseline for this user is left untouched — that's a
+    /// new device and still needs a real verification. A device whose key
+    /// no longer matches what we recorded is also left untouched — that's
+    /// a key-change violation, not something TOFU should paper over.
+    async fn apply_tofu(&self, user_id: &UserId, devices: &UserDevices) {
+        let known = match self.store.load_tofu_devices(&self.server_conf.name, user_id.as_str()).await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(%user_id, "tofu: load_tofu_devices failed: {e}");
+                return;
+            }
+        };
+        let first_contact = known.is_empty();
+        let known: HashMap<String, String> = known.into_iter().collect();
+
+        for device in devices.devices() {
+            if device.is_verified() {
+                continue;
+            }
+            let Some(key) = device.ed25519_key() else { continue };
+            let key_b64 = key.to_base64();
+            let device_id = device.device_id().to_string();
+
+            match known.get(&device_id) {
+                Some(recorded) if *recorded != key_b64 => {
+                    warn!(%user_id, %device_id, "tofu: device key changed since first contact, refusing to auto-trust");
+                }
+                Some(_) => {}
+                None if first_contact => {
+                    if let Err(e) = device.set_local_trust(LocalTrust::Verified).await {
+                        warn!(%user_id, %device_id, "tofu: set_local_trust failed: {e}");
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .store
+                        .save_tofu_device(&self.server_conf.name, user_id.as_str(), &device_id, &key_b64)
+                        .await
+                    {
+                        warn!(%user_id, %device_id, "tofu: save_tofu_device failed: {e}");
+                    }
+                    debug!(%user_id, %device_id, "tofu: trusted device on first contact");
+                }
+                None => {
+                    debug!(%user_id, %device_id, "tofu: new device for already-known user, requires manual verification");
+                }
+            }
+        }
+    }
+
     /// Returns true if any room member (other than ourselves) has a device
     /// that is not verified (neither manually nor via cross-signing).
     async fn has_unverified_devices(&self, users: &[OwnedUserId]) -> bool {
@@ -548,6 +626,9 @@ impl PanClient {
                 continue;
             }
             if let Ok(devices) = self.olm.get_user_devices(user_id, None).await {
+                if self.server_conf.tofu {
+                    self.apply_tofu(user_id, &devices).await;
+                }
                 for device in devices.devices() {
                     if !device.is_verified() {
                         debug!(
@@ -1314,10 +1395,36 @@ impl PanClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to import cross-signing keys: {e}"))?;
 
-        info!("cross-signing keys imported; uploading signatures");
+        info!("cross-signing keys imported; signing our own device");
 
-        // 5. Immediately flush outgoing requests so device signatures are uploaded
-        //    without waiting for the next sync cycle.
+        // 5. `import_cross_signing_keys` only stores the private keys locally —
+        //    it does not retroactively sign this device. If this device was
+        //    uploaded before recovery ran (e.g. a fresh login done prior to
+        //    running this command), its /keys/upload went out with no
+        //    self-signing signature, and nothing else ever re-signs it after
+        //    the fact. `bootstrap_cross_signing(false)` picks the
+        //    just-imported identity back up (it only creates a *new* identity
+        //    when `reset` is set or none is loaded) and produces the missing
+        //    signature for us to upload. The public cross-signing keys
+        //    themselves are already published (that's what we just recovered
+        //    from SSSS), so only the signature needs sending — re-uploading
+        //    them would risk hitting an unnecessary UIA prompt.
+        let bootstrap = self
+            .olm
+            .bootstrap_cross_signing(false)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to prepare device signature: {e}"))?;
+
+        let txn_id = ruma::TransactionId::new();
+        if let Err(e) = self
+            .send_signature_upload(base, token, &bootstrap.upload_signatures_req, &txn_id)
+            .await
+        {
+            warn!("signature upload after recover-identity: {e}");
+        }
+
+        // 6. Flush anything else outgoing (e.g. a keys/query the import
+        //    triggered) without waiting for the next sync cycle.
         self.process_outgoing_requests().await;
 
         Ok(())

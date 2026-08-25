@@ -31,6 +31,7 @@ fn server_conf(homeserver_url: &str) -> ServerConfig {
         proxy: None,
         ssl: false,
         ignore_verification: false,
+        tofu: false,
         use_keyring: false,
         search_requests: false,
         index_encrypted_only: false,
@@ -640,4 +641,120 @@ async fn test_download_with_filename_segment_proxied() {
     assert_eq!(resp.status(), 200);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&bytes[..], b"jpeg data");
+}
+
+/// A successful logout purges the saved access token and the crypto store,
+/// so the session isn't restored on the next daemon startup.
+#[tokio::test]
+async fn test_logout_purges_session() {
+    let mock = MockServer::start().await;
+    mount_crypto_noise(&mock).await;
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(PanStore::new(dir.path()).await.unwrap());
+    let daemon =
+        ProxyDaemon::new(server_conf(&mock.uri()), store.clone(), dir.path().to_path_buf(), None)
+            .await
+            .unwrap();
+    let router = build_router(daemon);
+    let router = do_login(router, &mock).await;
+
+    let crypto_dir = pantalaimon::client::crypto_store_dir(
+        dir.path(),
+        "@alice:localhost",
+        "DEVICE1",
+    );
+    assert!(crypto_dir.exists(), "crypto store should exist after login");
+    assert_eq!(
+        store.load_access_token("@alice:localhost", "DEVICE1").await.unwrap(),
+        Some("syt_test_token".to_owned())
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/logout"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&mock)
+        .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/_matrix/client/v3/logout")
+        .header("Authorization", "Bearer syt_test_token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert!(
+        store.load_access_token("@alice:localhost", "DEVICE1").await.unwrap().is_none(),
+        "access token should be deleted after logout"
+    );
+    assert!(!crypto_dir.exists(), "crypto store should be removed after logout");
+}
+
+/// A non-2xx logout response (homeserver rejected it) leaves the session
+/// untouched — we must not purge local state the homeserver didn't accept.
+#[tokio::test]
+async fn test_logout_upstream_failure_keeps_session() {
+    let mock = MockServer::start().await;
+    mount_crypto_noise(&mock).await;
+
+    let (router, store, _dir) = make_router(&mock).await;
+    let router = do_login(router, &mock).await;
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/logout"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(
+            json!({"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"}),
+        ))
+        .mount(&mock)
+        .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/_matrix/client/v3/logout")
+        .header("Authorization", "Bearer syt_test_token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    assert_eq!(
+        store.load_access_token("@alice:localhost", "DEVICE1").await.unwrap(),
+        Some("syt_test_token".to_owned()),
+        "session must survive a rejected logout"
+    );
+}
+
+/// `logout/all` purges every device belonging to the calling user, not just
+/// the one that made the request.
+#[tokio::test]
+async fn test_logout_all_purges_every_device() {
+    let mock = MockServer::start().await;
+    mount_crypto_noise(&mock).await;
+
+    let (router, store, _dir) = make_router(&mock).await;
+    let router = do_login(router, &mock).await;
+
+    // A second device for the same user, as if it had logged in previously.
+    store.save_server_user("test", "@alice:localhost").await.unwrap();
+    store.save_access_token("@alice:localhost", "DEVICE2", "syt_other_token").await.unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/logout/all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&mock)
+        .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/_matrix/client/v3/logout/all")
+        .header("Authorization", "Bearer syt_test_token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert!(store.load_access_token("@alice:localhost", "DEVICE1").await.unwrap().is_none());
+    assert!(store.load_access_token("@alice:localhost", "DEVICE2").await.unwrap().is_none());
 }

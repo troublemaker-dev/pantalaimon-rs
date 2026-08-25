@@ -137,6 +137,7 @@ INI format, `[Default]` section + one section per server. Key options:
 | `UseSSL` / `SSL` | `True` | Whether upstream uses HTTPS |
 | `UseKeyring` | `True` | Set `False` in containers |
 | `IgnoreVerification` | `False` | Skip unverified-device check |
+| `Tofu` | `False` | Trust-on-first-use: auto-trust a user's devices the first time seen; new devices added later, or a key that no longer matches, still require manual verification. No effect if `IgnoreVerification = True` |
 | `DropOldKeys` | `False` | Prune duplicate Megolm sessions on startup |
 
 ### Store

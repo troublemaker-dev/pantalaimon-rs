@@ -14,7 +14,11 @@ use tracing::{debug, info, warn};
 
 use crate::store::MediaInfo;
 
-use crate::{client::PanClient, error::AppError, proxy::daemon::ProxyDaemon};
+use crate::{
+    client::{crypto_store_dir, PanClient},
+    error::AppError,
+    proxy::daemon::ProxyDaemon,
+};
 
 // ---------------------------------------------------------------------------
 // Token extraction
@@ -65,6 +69,16 @@ pub fn load_from_keyring(user_id: &str, device_id: &str) -> Option<String> {
     keyring::Entry::new("pantalaimon", &key)
         .ok()
         .and_then(|e| e.get_password().ok())
+}
+
+pub fn delete_from_keyring(user_id: &str, device_id: &str) {
+    let key = keyring_key(user_id, device_id);
+    match keyring::Entry::new("pantalaimon", &key).and_then(|e| e.delete_credential()) {
+        Ok(_) => {}
+        // Nothing to delete is fine (e.g. UseKeyring was off at login time).
+        Err(keyring::Error::NoEntry) => {}
+        Err(e) => warn!(%user_id, "Keyring delete failed: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +165,120 @@ pub async fn login(
     }
 
     build_response(status, resp_headers, resp_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Logout — drop the session so a dead token isn't restored on next startup
+// ---------------------------------------------------------------------------
+
+/// Forget everything pantalaimon knows about one `(user_id, device_id)`
+/// session: the in-memory client registration is the caller's job (it
+/// differs between `logout` and `logout/all`); this handles the on-disk
+/// bits — the saved access token, the keyring entry, and the crypto store.
+async fn purge_session(daemon: &ProxyDaemon, user_id: &str, device_id: &str) {
+    info!(%user_id, %device_id, "Logout — purging session");
+
+    if let Err(e) = daemon.store.delete_access_token(user_id, device_id).await {
+        warn!(%user_id, %device_id, "delete_access_token: {e}");
+    }
+    if daemon.server_conf.use_keyring {
+        delete_from_keyring(user_id, device_id);
+    }
+    let crypto_dir = crypto_store_dir(&daemon.data_dir, user_id, device_id);
+    if let Err(e) = tokio::fs::remove_dir_all(&crypto_dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %crypto_dir.display(), "Failed to remove crypto store on logout: {e}");
+        }
+    }
+}
+
+/// `POST /_matrix/client/{r0,v3}/logout` — invalidates the calling device's
+/// session only.
+pub async fn logout(
+    State(daemon): State<Arc<ProxyDaemon>>,
+    req: Request,
+) -> Result<Response, AppError> {
+    let token = extract_token(&req);
+    let client = match &token {
+        Some(tok) => daemon.resolve_client(tok).await,
+        None => None,
+    };
+
+    let (status, resp_headers, resp_bytes) = forward_post(&daemon, req).await?;
+
+    if status.is_success() {
+        if let Some(client) = client {
+            daemon.remove_client(&client.user_id);
+            purge_session(&daemon, &client.user_id, &client.device_id).await;
+        }
+    }
+
+    build_response(status, resp_headers, resp_bytes)
+}
+
+/// `POST /_matrix/client/{r0,v3}/logout/all` — invalidates every device
+/// belonging to the calling user.
+pub async fn logout_all(
+    State(daemon): State<Arc<ProxyDaemon>>,
+    req: Request,
+) -> Result<Response, AppError> {
+    let token = extract_token(&req);
+    let client = match &token {
+        Some(tok) => daemon.resolve_client(tok).await,
+        None => None,
+    };
+
+    let (status, resp_headers, resp_bytes) = forward_post(&daemon, req).await?;
+
+    if status.is_success() {
+        if let Some(client) = client {
+            let user_id = client.user_id.clone();
+            daemon.remove_client(&user_id);
+
+            match daemon.store.load_session_tokens(&daemon.name).await {
+                Ok(sessions) => {
+                    for (uid, device_id, _token) in
+                        sessions.into_iter().filter(|(uid, ..)| *uid == user_id)
+                    {
+                        purge_session(&daemon, &uid, &device_id).await;
+                    }
+                }
+                Err(e) => warn!(%user_id, "load_session_tokens: {e}"),
+            }
+        }
+    }
+
+    build_response(status, resp_headers, resp_bytes)
+}
+
+/// Forward a `POST` request upstream as-is and return its raw response
+/// parts, without consuming/building an axum `Response` — shared by
+/// `logout`/`logout_all` so they can inspect the status before deciding
+/// whether to purge local state.
+async fn forward_post(
+    daemon: &ProxyDaemon,
+    req: Request,
+) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Bytes), AppError> {
+    let (parts, body) = req.into_parts();
+    let body_bytes: Bytes =
+        axum::body::to_bytes(body, 1024 * 1024).await.map_err(|_| AppError::Body)?;
+
+    let path = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let base = daemon.server_conf.homeserver.as_str().trim_end_matches('/');
+    let url = format!("{base}{path}");
+
+    let mut builder = daemon.http_client.post(&url);
+    for (name, value) in &parts.headers {
+        if name != "host" {
+            builder = builder.header(name.clone(), value.clone());
+        }
+    }
+    let upstream_resp = builder.body(body_bytes).send().await?;
+
+    let status = upstream_resp.status();
+    let resp_headers = upstream_resp.headers().clone();
+    let resp_bytes = upstream_resp.bytes().await?;
+    Ok((status, resp_headers, resp_bytes))
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,10 @@ pub struct ServerConfig {
     pub proxy: Option<Url>,
     pub ssl: bool,
     pub ignore_verification: bool,
+    /// Trust-on-first-use: silently trust a user's devices the first time
+    /// they're seen, only requiring manual verification for devices added
+    /// afterwards or ones whose key no longer matches what was recorded.
+    pub tofu: bool,
     pub use_keyring: bool,
     pub search_requests: bool,
     pub index_encrypted_only: bool,
@@ -131,6 +135,7 @@ pub fn read_config(path: &Path) -> anyhow::Result<PanConfig> {
             .or(get_bool(&section, "SSL")?)
             .unwrap_or(true);
         let ignore_verification = get_bool(&section, "IgnoreVerification")?.unwrap_or(false);
+        let tofu = get_bool(&section, "Tofu")?.unwrap_or(false);
         let use_keyring = get_bool(&section, "UseKeyring")?.unwrap_or(true);
         let search_requests = get_bool(&section, "SearchRequests")?.unwrap_or(false);
         let index_encrypted_only = get_bool(&section, "IndexEncryptedOnly")?.unwrap_or(true);
@@ -162,6 +167,7 @@ pub fn read_config(path: &Path) -> anyhow::Result<PanConfig> {
                 proxy,
                 ssl,
                 ignore_verification,
+                tofu,
                 use_keyring,
                 search_requests,
                 index_encrypted_only,
@@ -409,5 +415,23 @@ mod tests {
         );
         let cfg = read_config(f.path()).unwrap();
         assert!(cfg.servers["Local"].drop_old_keys);
+    }
+
+    #[test]
+    fn test_tofu_default_false() {
+        let f = write_config("[Local]\nHomeserver = http://localhost:8448\n");
+        let cfg = read_config(f.path()).unwrap();
+        assert!(!cfg.servers["Local"].tofu);
+    }
+
+    #[test]
+    fn test_tofu_enabled() {
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             Tofu = true\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert!(cfg.servers["Local"].tofu);
     }
 }

@@ -16,6 +16,11 @@ pub fn build_router(daemon: Arc<ProxyDaemon>) -> Router {
         // Login — GET returns available flows (proxy through); POST is intercepted
         .route("/_matrix/client/r0/login", get(proxy_pass).post(login))
         .route("/_matrix/client/v3/login", get(proxy_pass).post(login))
+        // Logout — intercepted so a dead session isn't restored on restart
+        .route("/_matrix/client/r0/logout", post(logout))
+        .route("/_matrix/client/v3/logout", post(logout))
+        .route("/_matrix/client/r0/logout/all", post(logout_all))
+        .route("/_matrix/client/v3/logout/all", post(logout_all))
         // Sync
         .route("/_matrix/client/r0/sync", get(sync))
         .route("/_matrix/client/v3/sync", get(sync))
