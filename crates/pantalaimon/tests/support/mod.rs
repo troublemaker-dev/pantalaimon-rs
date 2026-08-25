@@ -127,6 +127,7 @@ fn server_conf(base_url: &str, ignore_verification: bool) -> ServerConfig {
         proxy: None,
         ssl: false,
         ignore_verification,
+        tofu: false,
         use_keyring: false,
         search_requests: false,
         index_encrypted_only: false,
