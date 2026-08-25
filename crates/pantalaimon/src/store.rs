@@ -154,6 +154,16 @@ impl PanStore {
                     filename    TEXT NOT NULL,
                     mimetype    TEXT NOT NULL,
                     UNIQUE(server_id, content_uri)
+                );
+
+                CREATE TABLE IF NOT EXISTS pantofudevices (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id   INTEGER NOT NULL
+                        REFERENCES servers(id) ON DELETE CASCADE,
+                    user_id     TEXT NOT NULL,
+                    device_id   TEXT NOT NULL,
+                    ed25519_key TEXT NOT NULL,
+                    UNIQUE(server_id, user_id, device_id)
                 );",
             )?;
             Ok(())
@@ -273,6 +283,24 @@ impl PanStore {
                 )
                 .optional()?;
             Ok(token)
+        })
+        .await
+        .context("spawn_blocking panicked")?
+    }
+
+    /// Remove one `(user_id, device_id)` session — called on logout so a
+    /// dead access token isn't restored (and retried against the
+    /// homeserver) on the next daemon startup.
+    pub async fn delete_access_token(&self, user_id: &str, device_id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let (user_id, device_id) = (user_id.to_owned(), device_id.to_owned());
+        spawn_blocking(move || -> Result<()> {
+            let db = conn.lock().unwrap();
+            db.execute(
+                "DELETE FROM accesstokens WHERE user_id=?1 AND device_id=?2",
+                params![user_id, device_id],
+            )?;
+            Ok(())
         })
         .await
         .context("spawn_blocking panicked")?
@@ -599,6 +627,64 @@ impl PanStore {
         .await
         .context("spawn_blocking panicked")?
     }
+
+    // -----------------------------------------------------------------------
+    // Trust-on-first-use device records
+    // -----------------------------------------------------------------------
+
+    /// Record a device as trusted-on-first-use. A no-op if this
+    /// `(user_id, device_id)` is already recorded, so the originally-seen
+    /// key is never silently overwritten.
+    pub async fn save_tofu_device(
+        &self,
+        server_name: &str,
+        user_id: &str,
+        device_id: &str,
+        ed25519_key: &str,
+    ) -> Result<()> {
+        let server_id = self.get_or_create_server(server_name).await?;
+        let conn = self.conn.clone();
+        let (user_id, device_id, ed25519_key) =
+            (user_id.to_owned(), device_id.to_owned(), ed25519_key.to_owned());
+        spawn_blocking(move || -> Result<()> {
+            let db = conn.lock().unwrap();
+            db.execute(
+                "INSERT OR IGNORE INTO pantofudevices(server_id, user_id, device_id, ed25519_key)
+                 VALUES(?1, ?2, ?3, ?4)",
+                params![server_id, user_id, device_id, ed25519_key],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking panicked")?
+    }
+
+    /// Devices previously trusted-on-first-use for this user, as
+    /// `(device_id, ed25519_key)` pairs. Empty means we have never seen a
+    /// device for this user before.
+    pub async fn load_tofu_devices(
+        &self,
+        server_name: &str,
+        user_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.clone();
+        let (server_name, user_id) = (server_name.to_owned(), user_id.to_owned());
+        spawn_blocking(move || -> Result<Vec<(String, String)>> {
+            let db = conn.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT ptd.device_id, ptd.ed25519_key
+                 FROM pantofudevices ptd
+                 JOIN servers s ON s.id = ptd.server_id
+                 WHERE s.name = ?1 AND ptd.user_id = ?2",
+            )?;
+            let rows = stmt.query_map(params![server_name, user_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+        })
+        .await
+        .context("spawn_blocking panicked")?
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +751,34 @@ mod tests {
         let (store, _dir) = make_store().await;
         let got = store.load_access_token("@nobody:localhost", "D1").await.unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_access_token() {
+        let (store, _dir) = make_store().await;
+        store.save_access_token("@alice:localhost", "D1", "tok_a").await.unwrap();
+        store.delete_access_token("@alice:localhost", "D1").await.unwrap();
+        let got = store.load_access_token("@alice:localhost", "D1").await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_access_token_leaves_other_devices() {
+        let (store, _dir) = make_store().await;
+        store.save_access_token("@alice:localhost", "D1", "tok_a").await.unwrap();
+        store.save_access_token("@alice:localhost", "D2", "tok_b").await.unwrap();
+        store.delete_access_token("@alice:localhost", "D1").await.unwrap();
+        assert!(store.load_access_token("@alice:localhost", "D1").await.unwrap().is_none());
+        assert_eq!(
+            store.load_access_token("@alice:localhost", "D2").await.unwrap(),
+            Some("tok_b".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_access_token_missing_is_noop() {
+        let (store, _dir) = make_store().await;
+        store.delete_access_token("@nobody:localhost", "D1").await.unwrap();
     }
 
     #[tokio::test]
@@ -829,5 +943,51 @@ mod tests {
         // Second write is ignored; first row is preserved.
         assert_eq!(got.filename, "original.jpg");
         assert_eq!(got.mimetype, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn test_tofu_device_roundtrip() {
+        let (store, _dir) = make_store().await;
+        store
+            .save_tofu_device("local", "@bob:localhost", "DEVICE1", "ed25519key1")
+            .await
+            .unwrap();
+        let devices = store.load_tofu_devices("local", "@bob:localhost").await.unwrap();
+        assert_eq!(devices, vec![("DEVICE1".to_owned(), "ed25519key1".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn test_tofu_device_unknown_user_empty() {
+        let (store, _dir) = make_store().await;
+        let devices = store.load_tofu_devices("local", "@nobody:localhost").await.unwrap();
+        assert!(devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tofu_device_does_not_overwrite_key() {
+        // save_tofu_device uses INSERT OR IGNORE — the first-seen key wins
+        // even if a later call reports a different one for the same device.
+        let (store, _dir) = make_store().await;
+        store
+            .save_tofu_device("local", "@bob:localhost", "DEVICE1", "original_key")
+            .await
+            .unwrap();
+        store
+            .save_tofu_device("local", "@bob:localhost", "DEVICE1", "different_key")
+            .await
+            .unwrap();
+        let devices = store.load_tofu_devices("local", "@bob:localhost").await.unwrap();
+        assert_eq!(devices, vec![("DEVICE1".to_owned(), "original_key".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn test_tofu_device_server_isolation() {
+        let (store, _dir) = make_store().await;
+        store
+            .save_tofu_device("server_a", "@bob:localhost", "DEVICE1", "key1")
+            .await
+            .unwrap();
+        let devices = store.load_tofu_devices("server_b", "@bob:localhost").await.unwrap();
+        assert!(devices.is_empty());
     }
 }

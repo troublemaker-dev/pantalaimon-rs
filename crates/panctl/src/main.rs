@@ -83,6 +83,8 @@ trait Control {
         pan_user: &str,
         key_input: &str,
     ) -> zbus::Result<String>;
+    async fn request_missing_secrets(&self, pan_user: &str) -> zbus::Result<String>;
+    async fn bootstrap_cross_signing(&self, pan_user: &str, reset: bool) -> zbus::Result<String>;
 }
 
 #[zbus::proxy(
@@ -236,6 +238,26 @@ enum Cmd {
         key: Option<String>,
     },
 
+    /// Ask your other sessions to gossip missing cross-signing secrets
+    /// (normally happens automatically right after verifying a device; use
+    /// this to retry if the other device was offline at the time)
+    RequestMissingSecrets {
+        /// Your pantalaimon session user (@you:server)
+        pan_user: String,
+    },
+
+    /// Create (or replace) this account's cross-signing identity from
+    /// scratch. Only needed once per account, for one that has never set up
+    /// cross-signing.
+    BootstrapCrossSigning {
+        /// Your pantalaimon session user (@you:server)
+        pan_user: String,
+        /// Replace an existing cross-signing identity instead of erroring
+        /// if one is already present. This resets trust between all devices.
+        #[arg(long)]
+        reset: bool,
+    },
+
     /// Send a blocked message despite unverified devices
     SendAnyways {
         pan_user: String,
@@ -260,6 +282,13 @@ enum Cmd {
         pan_user: String,
         user_id: String,
         device_id: String,
+    },
+
+    /// Watch for daemon events in real time (unverified-device blocks, SAS invites, etc.)
+    Watch {
+        /// Only show events for this pantalaimon user (@alice:matrix.org)
+        #[arg(long)]
+        pan_user: Option<String>,
     },
 }
 
@@ -415,16 +444,30 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
             wait_response(&mut stream, &mid).await?;
         }
 
+        Cmd::RequestMissingSecrets { pan_user } => {
+            let mut stream = zbus::MessageStream::from(conn);
+            let mid = ctrl.request_missing_secrets(&pan_user).await?;
+            wait_response(&mut stream, &mid).await?;
+        }
+
+        Cmd::BootstrapCrossSigning { pan_user, reset } => {
+            let mut stream = zbus::MessageStream::from(conn);
+            let mid = ctrl.bootstrap_cross_signing(&pan_user, reset).await?;
+            wait_response(&mut stream, &mid).await?;
+        }
+
         Cmd::SendAnyways { pan_user, room_id } => {
             // SendAnyways uses a caller-provided message_id from the UnverifiedDevices signal.
             // Since panctl doesn't persist signal state across invocations, we use a static id.
+            let mut stream = zbus::MessageStream::from(conn);
             ctrl.send_anyways(&pan_user, "0", &room_id).await?;
-            println!("Send-anyways command dispatched.");
+            wait_response(&mut stream, "0").await?;
         }
 
         Cmd::CancelSending { pan_user, room_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             ctrl.cancel_sending(&pan_user, "0", &room_id).await?;
-            println!("Cancel-sending command dispatched.");
+            wait_response(&mut stream, "0").await?;
         }
 
         Cmd::ContinueKeyshare { pan_user, user_id, device_id } => {
@@ -438,9 +481,118 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
             let mid = ctrl.cancel_key_share(&pan_user, &user_id, &device_id).await?;
             wait_response(&mut stream, &mid).await?;
         }
+
+        Cmd::Watch { pan_user } => {
+            let mut stream = zbus::MessageStream::from(conn);
+            watch(&mut stream, pan_user.as_deref()).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Continuously print daemon events as they arrive, until interrupted.
+///
+/// This exists so a blocked send (unverified devices) or an incoming SAS
+/// invite can be caught and acted on within the daemon's 30s / 120s
+/// response windows, instead of being discovered too late in the logs.
+async fn watch(stream: &mut zbus::MessageStream, filter_user: Option<&str>) -> Result<()> {
+    if let Some(u) = filter_user {
+        println!("Watching pantalaimon events for {u} (Ctrl-C to stop)...");
+    } else {
+        println!("Watching pantalaimon events (Ctrl-C to stop)...");
+    }
+
+    loop {
+        let Some(Ok(msg)) = stream.next().await else {
+            continue;
+        };
+
+        let hdr = msg.header();
+        if hdr.message_type() != zbus::message::Type::Signal {
+            continue;
+        }
+        let Some(member) = hdr.member().map(|m| m.as_str()) else {
+            continue;
+        };
+
+        match member {
+            "UnverifiedDevices" => {
+                let Ok((pan_user, room_id, room_display_name)) =
+                    msg.body().deserialize::<(String, String, String)>()
+                else {
+                    continue;
+                };
+                if filter_user.is_some_and(|u| u != pan_user) {
+                    continue;
+                }
+                println!(
+                    "\n[BLOCKED SEND] {pan_user}: \"{room_display_name}\" ({room_id}) has unverified devices.\n  panctl send-anyways {pan_user} {room_id}\n  panctl cancel-sending {pan_user} {room_id}"
+                );
+            }
+            "SasInvite" => {
+                let Ok((pan_user, user_id, device_id, _txn_id)) =
+                    msg.body().deserialize::<(String, String, String, String)>()
+                else {
+                    continue;
+                };
+                if filter_user.is_some_and(|u| u != pan_user) {
+                    continue;
+                }
+                println!(
+                    "\n[SAS INVITE] {pan_user}: {user_id}/{device_id} wants to verify.\n  panctl accept-verification {pan_user} {user_id} {device_id}"
+                );
+            }
+            "SasShow" => {
+                let Ok((pan_user, user_id, device_id, _txn_id, emoji)) = msg
+                    .body()
+                    .deserialize::<(String, String, String, String, Vec<(String, String)>)>()
+                else {
+                    continue;
+                };
+                if filter_user.is_some_and(|u| u != pan_user) {
+                    continue;
+                }
+                let codes: Vec<String> =
+                    emoji.iter().map(|(symbol, name)| format!("{symbol} {name}")).collect();
+                println!(
+                    "\n[SAS COMPARE] {pan_user}: {user_id}/{device_id} — {}\n  Match:    panctl confirm-verification {pan_user} {user_id} {device_id}\n  Mismatch: panctl cancel-verification {pan_user} {user_id} {device_id}",
+                    codes.join("   ")
+                );
+            }
+            "SasDone" => {
+                let Ok((pan_user, user_id, device_id, _txn_id)) =
+                    msg.body().deserialize::<(String, String, String, String)>()
+                else {
+                    continue;
+                };
+                if filter_user.is_some_and(|u| u != pan_user) {
+                    continue;
+                }
+                println!("\n[SAS DONE] {pan_user}: verification with {user_id}/{device_id} finished.");
+            }
+            "UpdateUser" => {
+                let Ok((server, user_id, device_id)) =
+                    msg.body().deserialize::<(String, String, String)>()
+                else {
+                    continue;
+                };
+                println!("\n[USER TRACKED] {server}: {user_id}/{device_id}");
+            }
+            "UpdateDevices" => {
+                let Ok((pan_user, _devices_json)) =
+                    msg.body().deserialize::<(String, String)>()
+                else {
+                    continue;
+                };
+                if filter_user.is_some_and(|u| u != pan_user) {
+                    continue;
+                }
+                println!("\n[DEVICES UPDATED] {pan_user}");
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

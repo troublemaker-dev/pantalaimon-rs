@@ -5,15 +5,15 @@ use std::{collections::{BTreeMap, HashMap}, path::{Path, PathBuf}, sync::Arc};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
-    AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, DecryptionSettings,
-    EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine,
-    Sas, TrustRequirement,
+    AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, CrossSigningStatus,
+    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo,
+    MegolmError, OlmMachine, Sas, TrustRequirement, UserDevices, VerificationRequestState,
     decrypt_room_key_export, encrypt_room_key_export,
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
     types::{
         events::room::encrypted::EncryptedEvent,
         requests::{
-            AnyIncomingResponse, AnyOutgoingRequest, OutgoingVerificationRequest,
+            AnyIncomingResponse, AnyOutgoingRequest, OutgoingRequest, OutgoingVerificationRequest,
             RoomMessageRequest, ToDeviceRequest,
         },
     },
@@ -38,15 +38,15 @@ use ruma::{
         secret_storage::{
             default_key::SecretStorageDefaultKeyEventContent,
             key::SecretStorageKeyEventContent,
-            secret::SecretEventContent,
+            secret::{SecretEncryptedData, SecretEventContent},
         },
     },
     serde::Raw,
-    EventId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
+    EventId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
 };
 use serde::Deserialize;
 use serde_json::{json, value::to_raw_value, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -54,6 +54,10 @@ use crate::{
     messages::{DaemonToUi, UiToDaemon},
     store::PanStore,
 };
+
+/// How long to hold an outgoing send open while waiting for a manual
+/// send-anyways/cancel-sending decision on a room with unverified devices.
+const UNVERIFIED_SEND_TIMEOUT_SECS: u64 = 120;
 
 /// Outcome of `prepare_and_encrypt`.
 pub enum SendOutcome {
@@ -63,6 +67,18 @@ pub enum SendOutcome {
     Encrypted { event_type: String, content: Value },
     /// User (or timeout) cancelled the send; caller should return 403.
     Cancelled,
+}
+
+/// Directory holding a `(user_id, device_id)` session's crypto store
+/// (`matrix-sdk-crypto.sqlite3` lives inside it). Shared between
+/// `PanClient::new`, which opens it, and logout handling, which deletes it.
+pub fn crypto_store_dir(data_dir: &Path, user_id: &str, device_id: &str) -> PathBuf {
+    let sanitized_uid = user_id.trim_start_matches('@').replace(':', "_");
+    let sanitized_did = device_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect::<String>();
+    data_dir.join(format!("crypto-{}_{}", sanitized_uid, sanitized_did))
 }
 
 /// Delete all but the most recently inserted inbound group session per
@@ -134,6 +150,14 @@ pub struct PanClient {
     notified_done: DashMap<String, ()>,
     /// Room sends pending a user decision (room_id → oneshot, true=proceed/false=cancel).
     pending_sends: DashMap<String, oneshot::Sender<bool>>,
+    /// Events queued for a room-key re-request after a MissingRoomKey decrypt
+    /// failure during `process_sync`; flushed in `run_post_sync_tasks`.
+    missing_room_keys: std::sync::Mutex<Vec<(OwnedRoomId, Raw<EncryptedEvent>)>>,
+    /// Serializes `run_post_sync_tasks` — the real `/sync` route spawns it
+    /// fire-and-forget after every sync response, so overlapping syncs (a
+    /// client retry, or a caller that also awaits it directly) can otherwise
+    /// run two invocations concurrently on the same OlmMachine at once.
+    sync_tasks_lock: AsyncMutex<()>,
 }
 
 impl PanClient {
@@ -154,12 +178,7 @@ impl PanClient {
         // SqliteCryptoStore::open takes a directory; it creates
         // matrix-sdk-crypto.sqlite3 inside it.  Include device_id so that
         // multiple sessions for the same user each get their own store.
-        let sanitized_uid = user_id.trim_start_matches('@').replace(':', "_");
-        let sanitized_did = device_id
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-            .collect::<String>();
-        let crypto_db = data_dir.join(format!("crypto-{}_{}", sanitized_uid, sanitized_did));
+        let crypto_db = crypto_store_dir(data_dir, &user_id, &device_id);
 
         // Drop old inbound Megolm sessions before opening the store (no concurrent access).
         // The actual SQLite file is matrix-sdk-crypto.sqlite3 inside the crypto_db directory.
@@ -194,6 +213,8 @@ impl PanClient {
             notified_show: DashMap::new(),
             notified_done: DashMap::new(),
             pending_sends: DashMap::new(),
+            missing_room_keys: std::sync::Mutex::new(Vec::new()),
+            sync_tasks_lock: AsyncMutex::new(()),
         })
     }
 
@@ -368,7 +389,15 @@ impl PanClient {
                         }
                         Err(e) => warn!("serialize decrypted event: {e}"),
                     },
-                    Err(e) => debug!("decrypt {room_id_str}: {e}"),
+                    Err(e) => {
+                        debug!("decrypt {room_id_str}: {e}");
+                        if matches!(e, MegolmError::MissingRoomKey(_)) {
+                            self.missing_room_keys
+                                .lock()
+                                .unwrap()
+                                .push((room_id.clone(), raw_event.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -393,11 +422,20 @@ impl PanClient {
         let decryption_settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
         };
-        let decrypted = self
+        let decrypted = match self
             .olm
             .decrypt_room_event(&raw_event, &room_id, &decryption_settings)
             .await
-            .ok()?;
+        {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("decrypt {room_id}: {e}");
+                if matches!(e, MegolmError::MissingRoomKey(_)) {
+                    self.request_and_send_room_key(&raw_event, &room_id).await;
+                }
+                return None;
+            }
+        };
         let mut cleartext = serde_json::to_value(&decrypted.event).ok()?;
         for field in ["event_id", "origin_server_ts", "sender", "room_id", "unsigned"] {
             if let Some(val) = event.get(field) {
@@ -416,6 +454,18 @@ impl PanClient {
     /// If the room is known to be E2E-encrypted, claims any missing OTKs,
     /// shares the room key, and returns `("m.room.encrypted", encrypted_json)`.
     /// Otherwise returns the original `(event_type, content)` unchanged.
+    /// Make sure `olm` is tracking `users` and has a fresh `/keys/query` for
+    /// any of them it doesn't yet know about, flushing that query
+    /// synchronously so callers immediately see up-to-date device lists.
+    async fn ensure_devices_tracked(&self, users: &[OwnedUserId]) -> Result<()> {
+        self.olm
+            .update_tracked_users(users.iter().map(AsRef::as_ref))
+            .await
+            .context("update_tracked_users")?;
+        self.process_outgoing_requests().await;
+        Ok(())
+    }
+
     pub async fn prepare_and_encrypt(
         &self,
         room_id: &str,
@@ -431,6 +481,12 @@ impl PanClient {
 
         let ruma_room_id = RoomId::parse(room_id)?;
         let users = self.get_room_member_ids(&ruma_room_id).await?;
+
+        // OlmMachine never queries a user's keys on its own — without this,
+        // share_room_key/get_missing_sessions below silently operate on
+        // whatever's already cached (nothing, for a user we've never sent
+        // to), so the room key never reaches devices we haven't tracked.
+        self.ensure_devices_tracked(&users).await?;
 
         // Block if any room member has unverified devices (unless config says ignore)
         if !self.server_conf.ignore_verification && self.has_unverified_devices(&users).await {
@@ -450,7 +506,7 @@ impl PanClient {
             self.pending_sends.insert(room_id.to_owned(), tx);
 
             let proceed = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(UNVERIFIED_SEND_TIMEOUT_SECS),
                 rx,
             )
             .await
@@ -507,12 +563,69 @@ impl PanClient {
             .olm
             .encrypt_room_event_raw(&ruma_room_id, event_type, &raw_content)
             .await?;
-        let encrypted_value = serde_json::to_value(&encrypted)?;
+        // `encrypt_room_event_raw` bundles the actual encrypted event content
+        // together with local `encryption_info` about the operation we just
+        // performed (our own device/session info) — only `content` is the
+        // wire event body; `encryption_info` is never sent to the homeserver.
+        let encrypted_value = serde_json::to_value(&encrypted.content)?;
 
         Ok(SendOutcome::Encrypted {
             event_type: "m.room.encrypted".to_owned(),
             content: encrypted_value,
         })
+    }
+
+    /// Trust-on-first-use: the first time we ever see a device for
+    /// `user_id`, mark it locally verified and remember its Ed25519 key.
+    /// A device we've never recorded that shows up *after* we've already
+    /// established a baseline for this user is left untouched — that's a
+    /// new device and still needs a real verification. A device whose key
+    /// no longer matches what we recorded is also left untouched — that's
+    /// a key-change violation, not something TOFU should paper over.
+    async fn apply_tofu(&self, user_id: &UserId, devices: &UserDevices) {
+        let known = match self.store.load_tofu_devices(&self.server_conf.name, user_id.as_str()).await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(%user_id, "tofu: load_tofu_devices failed: {e}");
+                return;
+            }
+        };
+        let first_contact = known.is_empty();
+        let known: HashMap<String, String> = known.into_iter().collect();
+
+        for device in devices.devices() {
+            if device.is_verified() {
+                continue;
+            }
+            let Some(key) = device.ed25519_key() else { continue };
+            let key_b64 = key.to_base64();
+            let device_id = device.device_id().to_string();
+
+            match known.get(&device_id) {
+                Some(recorded) if *recorded != key_b64 => {
+                    warn!(%user_id, %device_id, "tofu: device key changed since first contact, refusing to auto-trust");
+                }
+                Some(_) => {}
+                None if first_contact => {
+                    if let Err(e) = device.set_local_trust(LocalTrust::Verified).await {
+                        warn!(%user_id, %device_id, "tofu: set_local_trust failed: {e}");
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .store
+                        .save_tofu_device(&self.server_conf.name, user_id.as_str(), &device_id, &key_b64)
+                        .await
+                    {
+                        warn!(%user_id, %device_id, "tofu: save_tofu_device failed: {e}");
+                    }
+                    debug!(%user_id, %device_id, "tofu: trusted device on first contact");
+                }
+                None => {
+                    debug!(%user_id, %device_id, "tofu: new device for already-known user, requires manual verification");
+                }
+            }
+        }
     }
 
     /// Returns true if any room member (other than ourselves) has a device
@@ -523,6 +636,9 @@ impl PanClient {
                 continue;
             }
             if let Ok(devices) = self.olm.get_user_devices(user_id, None).await {
+                if self.server_conf.tofu {
+                    self.apply_tofu(user_id, &devices).await;
+                }
                 for device in devices.devices() {
                     if !device.is_verified() {
                         debug!(
@@ -576,9 +692,51 @@ impl PanClient {
     /// Called from the sync handler in a spawned task so the sync response
     /// is returned to the client before any homeserver round-trips happen.
     pub async fn run_post_sync_tasks(self: std::sync::Arc<Self>) {
+        let _guard = self.sync_tasks_lock.lock().await;
+        self.flush_missing_room_key_requests().await;
         self.process_outgoing_requests().await;
         self.check_pending_requests().await;
         self.check_sas_states().await;
+    }
+
+    /// Drain room-key re-requests queued by the last `process_sync` decrypt
+    /// pass (see `missing_room_keys`) and send them out.
+    async fn flush_missing_room_key_requests(&self) {
+        let pending: Vec<_> = std::mem::take(&mut *self.missing_room_keys.lock().unwrap());
+        for (room_id, raw_event) in pending {
+            self.request_and_send_room_key(&raw_event, &room_id).await;
+        }
+    }
+
+    /// Ask other devices for the Megolm session used to encrypt `raw_event`,
+    /// sending the resulting to-device request(s) immediately.
+    async fn request_and_send_room_key(&self, raw_event: &Raw<EncryptedEvent>, room_id: &RoomId) {
+        let (cancel, request) = match self.olm.request_room_key(raw_event, room_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("request_room_key for {room_id}: {e}");
+                return;
+            }
+        };
+        if let Some(cancel) = &cancel {
+            self.send_key_request(cancel).await;
+        }
+        self.send_key_request(&request).await;
+    }
+
+    async fn send_key_request(&self, req: &OutgoingRequest) {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        match req.request() {
+            AnyOutgoingRequest::ToDeviceRequest(r) => {
+                if let Err(e) = self
+                    .send_to_device(base, &self.access_token, r, req.request_id())
+                    .await
+                {
+                    warn!("room key request to-device: {e}");
+                }
+            }
+            _ => warn!("unexpected outgoing request type from request_room_key"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1024,6 +1182,19 @@ impl PanClient {
                     Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
                 }
             }
+            UiToDaemon::RequestMissingSecrets { message_id, .. } => {
+                match self.request_missing_secrets().await {
+                    Ok(true) => respond!(message_id, "M_OK", "Requested missing secrets from other sessions"),
+                    Ok(false) => respond!(message_id, "M_OK", "No missing secrets to request"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::BootstrapCrossSigning { message_id, reset, .. } => {
+                match self.do_bootstrap_cross_signing(reset).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Cross-signing identity created and published"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
         }
     }
 
@@ -1178,6 +1349,118 @@ impl PanClient {
     }
 
     // -----------------------------------------------------------------------
+    // Cross-signing bootstrap (creating a brand-new identity) + UIA
+    // -----------------------------------------------------------------------
+
+    /// Current local cross-signing key material this device has.
+    pub async fn cross_signing_status(&self) -> CrossSigningStatus {
+        self.olm.cross_signing_status().await
+    }
+
+    /// POST `body` to `url`, transparently completing a user-interactive-auth
+    /// (UIA) challenge if the homeserver responds with one and it can be
+    /// satisfied without extra credentials — currently: a flow consisting
+    /// solely of the trivial `m.login.dummy` stage.
+    ///
+    /// `PanClient` only ever holds an access token, never the account
+    /// password (pantalaimon proxies the login request but doesn't retain
+    /// the password afterward), so any flow that actually requires a
+    /// credential stage (`m.login.password`, etc.) can't be completed here.
+    /// That case returns a clear, actionable error instead of a raw 401.
+    async fn post_with_uia(&self, url: &str, mut body: Value) -> Result<Value> {
+        let resp =
+            self.http_client.post(url).bearer_auth(&self.access_token).json(&body).send().await?;
+        if resp.status().as_u16() != 401 {
+            let status = resp.status();
+            let json: Value = resp.json().await.unwrap_or(Value::Null);
+            return if status.is_success() {
+                Ok(json)
+            } else {
+                anyhow::bail!("{status}: {json}")
+            };
+        }
+
+        let challenge: Value = resp.json().await?;
+        let session = challenge
+            .get("session")
+            .and_then(|v| v.as_str())
+            .context("UIA challenge response missing session id")?
+            .to_owned();
+        let flows = challenge.get("flows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+        let dummy_flow = flows.iter().any(|f| {
+            f.get("stages")
+                .and_then(|s| s.as_array())
+                .map(|s| s.len() == 1 && s[0].as_str() == Some("m.login.dummy"))
+                .unwrap_or(false)
+        });
+
+        if !dummy_flow {
+            let stages: Vec<String> = flows
+                .iter()
+                .filter_map(|f| f.get("stages").and_then(|s| s.as_array()))
+                .flat_map(|s| s.iter().filter_map(|v| v.as_str().map(str::to_owned)))
+                .collect();
+            anyhow::bail!(
+                "homeserver requires interactive auth ({}) for this action (session {session}) \
+                 — pantalaimon only holds an access token, not your account password, so it \
+                 can't complete this automatically. Complete it from a client that has your \
+                 credentials, then retry.",
+                stages.join(", ")
+            );
+        }
+
+        body["auth"] = json!({ "type": "m.login.dummy", "session": session });
+        let resp =
+            self.http_client.post(url).bearer_auth(&self.access_token).json(&body).send().await?;
+        let status = resp.status();
+        let json: Value = resp.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            Ok(json)
+        } else {
+            anyhow::bail!("{status}: {json}")
+        }
+    }
+
+    /// Create (or, with `reset`, replace) this account's cross-signing
+    /// identity from scratch. Unlike `request_missing_secrets` (which asks
+    /// for *existing* secrets from another session), this generates brand
+    /// new cross-signing keys locally and publishes them — there is nothing
+    /// to gossip beforehand, so this is only meaningful for an account that
+    /// has never set up cross-signing (or wants to reset it).
+    async fn do_bootstrap_cross_signing(&self, reset: bool) -> Result<()> {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let reqs = self.olm.bootstrap_cross_signing(reset).await?;
+
+        if let Some(upload_keys_req) = &reqs.upload_keys_req {
+            if let AnyOutgoingRequest::KeysUpload(r) = upload_keys_req.request() {
+                self.send_keys_upload(base, &self.access_token, r, upload_keys_req.request_id())
+                    .await?;
+            }
+        }
+
+        let signing_body = json!({
+            "master_key": reqs.upload_signing_keys_req.master_key,
+            "self_signing_key": reqs.upload_signing_keys_req.self_signing_key,
+            "user_signing_key": reqs.upload_signing_keys_req.user_signing_key,
+        });
+        self.post_with_uia(&format!("{base}/_matrix/client/v3/keys/device_signing/upload"), signing_body)
+            .await
+            .context("uploading cross-signing keys")?;
+
+        let sig_body = serde_json::to_value(&reqs.upload_signatures_req.signed_keys)?;
+        self.http_client
+            .post(format!("{base}/_matrix/client/v3/keys/signatures/upload"))
+            .bearer_auth(&self.access_token)
+            .json(&sig_body)
+            .send()
+            .await
+            .context("uploading cross-signing signatures")?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // SSSS / cross-signing identity recovery
     // -----------------------------------------------------------------------
 
@@ -1248,10 +1531,36 @@ impl PanClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to import cross-signing keys: {e}"))?;
 
-        info!("cross-signing keys imported; uploading signatures");
+        info!("cross-signing keys imported; signing our own device");
 
-        // 5. Immediately flush outgoing requests so device signatures are uploaded
-        //    without waiting for the next sync cycle.
+        // 5. `import_cross_signing_keys` only stores the private keys locally —
+        //    it does not retroactively sign this device. If this device was
+        //    uploaded before recovery ran (e.g. a fresh login done prior to
+        //    running this command), its /keys/upload went out with no
+        //    self-signing signature, and nothing else ever re-signs it after
+        //    the fact. `bootstrap_cross_signing(false)` picks the
+        //    just-imported identity back up (it only creates a *new* identity
+        //    when `reset` is set or none is loaded) and produces the missing
+        //    signature for us to upload. The public cross-signing keys
+        //    themselves are already published (that's what we just recovered
+        //    from SSSS), so only the signature needs sending — re-uploading
+        //    them would risk hitting an unnecessary UIA prompt.
+        let bootstrap = self
+            .olm
+            .bootstrap_cross_signing(false)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to prepare device signature: {e}"))?;
+
+        let txn_id = ruma::TransactionId::new();
+        if let Err(e) = self
+            .send_signature_upload(base, token, &bootstrap.upload_signatures_req, &txn_id)
+            .await
+        {
+            warn!("signature upload after recover-identity: {e}");
+        }
+
+        // 6. Flush anything else outgoing (e.g. a keys/query the import
+        //    triggered) without waiting for the next sync cycle.
         self.process_outgoing_requests().await;
 
         Ok(())
@@ -1305,9 +1614,8 @@ impl PanClient {
             .get(key_id)
             .with_context(|| format!("{type_str} is not encrypted with key {key_id}"))?;
 
-        let encrypted_data: AesHmacSha2EncryptedData = encrypted
-            .clone()
-            .try_into()
+        let encrypted_data: AesHmacSha2EncryptedData = SecretEncryptedData::deserialize_as_aes_hmac_sha2(encrypted)
+            .and_then(TryInto::try_into)
             .map_err(|e: serde_json::Error| {
                 anyhow::anyhow!("Invalid encrypted payload for {type_str}: {e}")
             })?;
@@ -1423,6 +1731,31 @@ impl PanClient {
                         to_remove.push(flow_id);
                     }
                 }
+                continue;
+            }
+
+            // The remote can send `m.key.verification.ready` immediately
+            // followed by its own `m.key.verification.start` (this is what
+            // `accept_sas_from_device` does). If both land in the same sync
+            // batch, `receive_sync_changes` processes them together and the
+            // request skips straight from `Requested` to `Transitioned`
+            // without ever being observably `Ready` here — `is_ready()`
+            // above misses it entirely. Without this branch the pending
+            // request lingers forever and the initiator never sees the Sas
+            // the other side already started.
+            if let VerificationRequestState::Transitioned { verification, .. } = req.state() {
+                if let Some(sas) = verification.sas_v1() {
+                    let device_id = sas.other_device_id().to_string();
+                    info!(%user_id_str, %device_id, %flow_id, "SAS already started by remote; adopting it");
+                    // We're the recipient of their `m.key.verification.start`
+                    // (we didn't call start_sas() ourselves), so we still owe
+                    // them our own `m.key.verification.accept`.
+                    if let Some(outgoing) = sas.accept() {
+                        self.send_outgoing_verification(base, token, &outgoing).await;
+                    }
+                    self.active_sas.insert(format!("{user_id_str}:{device_id}"), *sas);
+                    to_remove.push(flow_id);
+                }
             }
         }
 
@@ -1457,6 +1790,16 @@ impl PanClient {
                         transaction_id: sas.flow_id().as_str().to_owned(),
                     })
                     .await;
+
+                    // A successful verification means we now mutually trust
+                    // this device — ask it (and any other verified sessions)
+                    // for cross-signing secrets we're missing, the same way
+                    // Element bootstraps a freshly-verified device.
+                    if !sas.is_cancelled() && sas.is_self_verification() {
+                        if let Err(e) = self.request_missing_secrets().await {
+                            warn!("request_missing_secrets after SAS done: {e}");
+                        }
+                    }
                 }
                 to_remove.push((key, sas.flow_id().as_str().to_owned()));
                 continue;
@@ -1492,6 +1835,26 @@ impl PanClient {
             self.notified_done.remove(&key);
             self.notified_invite.remove(&flow_id);
         }
+    }
+
+    /// Ask our other sessions to gossip any cross-signing secrets (and the
+    /// key-backup decryption key) this device is missing, via
+    /// `m.secret.request`/`m.secret.send` to-device messages. A verified
+    /// peer session answers automatically (`receive_sync_changes` already
+    /// handles incoming `m.secret.request`s and queues the reply as a normal
+    /// outgoing to-device request), and an incoming `m.secret.send` is
+    /// imported automatically too — this call only needs to kick off the
+    /// request and flush it.
+    ///
+    /// Returns `true` if a request was actually sent (i.e. something was
+    /// missing and not already requested).
+    async fn request_missing_secrets(&self) -> Result<bool> {
+        let requested = self.olm.query_missing_secrets_from_other_sessions().await?;
+        if requested {
+            info!("requesting missing cross-signing secrets from other sessions");
+            self.process_outgoing_requests().await;
+        }
+        Ok(requested)
     }
 
     /// Dispatch an `OutgoingVerificationRequest` — either a to-device message

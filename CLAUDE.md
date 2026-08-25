@@ -28,6 +28,12 @@ cargo test
 cargo test test_name
 ```
 
+Real key-exchange integration tests (two independent PanClients against a
+real containerized homeserver — Olm/Megolm exchange, SAS verification,
+unverified-device send-block) live in
+`crates/pantalaimon/tests/key_exchange_test.rs` and are `#[ignore]`d by
+default. See [docs/testing.md](docs/testing.md) for how to run them.
+
 ## Container
 
 D-Bus is Linux-only; the container is required on macOS to use panctl.
@@ -137,6 +143,7 @@ INI format, `[Default]` section + one section per server. Key options:
 | `UseSSL` / `SSL` | `True` | Whether upstream uses HTTPS |
 | `UseKeyring` | `True` | Set `False` in containers |
 | `IgnoreVerification` | `False` | Skip unverified-device check |
+| `Tofu` | `False` | Trust-on-first-use: auto-trust a user's devices the first time seen; new devices added later, or a key that no longer matches, still require manual verification. No effect if `IgnoreVerification = True` |
 | `DropOldKeys` | `False` | Prune duplicate Megolm sessions on startup |
 
 ### Store
@@ -153,5 +160,5 @@ Crypto state (Olm/Megolm sessions, device keys, verification state) is stored se
 ### Known limitations
 
 - No independent sync loop — pantalaimon's OlmMachine is only updated when a client syncs through it. Verification requests from other clients won't be visible until the proxied client syncs.
-- panctl is not interactive (no REPL); each command is a separate invocation.
-- Blocked-send notifications require panctl to be running and watching; there are no OS notifications.
+- panctl is not interactive (no REPL); each command is a separate invocation. `panctl watch` runs continuously and prints events (blocked sends, SAS invites) as they arrive, with the exact follow-up command to run — but there are still no OS notifications, so a terminal has to be watching it.
+- A blocked send (unverified devices) holds the original `PUT /send` request open for `UNVERIFIED_SEND_TIMEOUT_SECS` (client.rs, currently 120s) waiting for `send-anyways`/`cancel-sending`. This is server-side only — it does not extend the Matrix client's own HTTP timeout on that request. If the client gives up and closes the connection first, its request future is dropped, and a `send-anyways` issued afterward silently does nothing (the oneshot receiver is already gone). `panctl watch` reduces how often this happens by cutting reaction time, but doesn't eliminate the race.
