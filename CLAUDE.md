@@ -28,6 +28,12 @@ cargo test
 cargo test test_name
 ```
 
+Real key-exchange integration tests (two independent PanClients against a
+real containerized homeserver — Olm/Megolm exchange, SAS verification,
+unverified-device send-block) live in
+`crates/pantalaimon/tests/key_exchange_test.rs` and are `#[ignore]`d by
+default. See [docs/testing.md](docs/testing.md) for how to run them.
+
 ## Container
 
 D-Bus is Linux-only; the container is required on macOS to use panctl.

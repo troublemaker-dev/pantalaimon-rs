@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use matrix_sdk_crypto::{
     AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, DecryptionSettings,
     EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, MegolmError,
-    OlmMachine, Sas, TrustRequirement, UserDevices,
+    OlmMachine, Sas, TrustRequirement, UserDevices, VerificationRequestState,
     decrypt_room_key_export, encrypt_room_key_export,
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
     types::{
@@ -1595,6 +1595,31 @@ impl PanClient {
                         warn!(%flow_id, "start_sas on pending request: {e}");
                         to_remove.push(flow_id);
                     }
+                }
+                continue;
+            }
+
+            // The remote can send `m.key.verification.ready` immediately
+            // followed by its own `m.key.verification.start` (this is what
+            // `accept_sas_from_device` does). If both land in the same sync
+            // batch, `receive_sync_changes` processes them together and the
+            // request skips straight from `Requested` to `Transitioned`
+            // without ever being observably `Ready` here — `is_ready()`
+            // above misses it entirely. Without this branch the pending
+            // request lingers forever and the initiator never sees the Sas
+            // the other side already started.
+            if let VerificationRequestState::Transitioned { verification, .. } = req.state() {
+                if let Some(sas) = verification.sas_v1() {
+                    let device_id = sas.other_device_id().to_string();
+                    info!(%user_id_str, %device_id, %flow_id, "SAS already started by remote; adopting it");
+                    // We're the recipient of their `m.key.verification.start`
+                    // (we didn't call start_sas() ourselves), so we still owe
+                    // them our own `m.key.verification.accept`.
+                    if let Some(outgoing) = sas.accept() {
+                        self.send_outgoing_verification(base, token, &outgoing).await;
+                    }
+                    self.active_sas.insert(format!("{user_id_str}:{device_id}"), *sas);
+                    to_remove.push(flow_id);
                 }
             }
         }

@@ -231,3 +231,11 @@ podman exec -it pantalaimon panctl <command>
 | `export-keys <pan_user> <file> <passphrase>` | Export E2E keys |
 
 `<pan_user>` is the full Matrix user ID of the session pantalaimon is managing (e.g. `@alice:example.com`).
+
+## Testing
+
+`cargo test` runs the hermetic unit/mocked-integration suite (no network or
+container required). Real key-exchange integration tests — two independent
+crypto identities exchanging Olm/Megolm sessions and SAS verifications over
+a real, containerized Matrix homeserver — live separately and are opt-in.
+See [docs/testing.md](docs/testing.md) for how to run them.
