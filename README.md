@@ -145,6 +145,12 @@ The other client will receive a verification request. Once accepted, both sides 
 panctl confirm-verification @alice:example.com @bob:example.com BOB_DEVICE_ID
 ```
 
+When the two devices being verified belong to the *same* account, pantalaimon automatically requests any missing cross-signing secrets from the other session right after verification completes — no separate `recover-identity` step needed. If the other device was offline at that moment, retry manually:
+
+```
+panctl request-missing-secrets @alice:example.com
+```
+
 ### Manual trust
 
 If cross-signing verification already happened in another client (e.g. between iamb and ement), pantalaimon recognises that trust automatically. If you want to bypass SAS entirely:
@@ -227,6 +233,7 @@ podman exec -it pantalaimon panctl <command>
 | `send-anyways <pan_user> <room_id>` | Allow a blocked send |
 | `cancel-sending <pan_user> <room_id>` | Cancel a blocked send |
 | `recover-identity <pan_user>` | Restore cross-signing from SSSS |
+| `request-missing-secrets <pan_user>` | Ask your other sessions to gossip missing cross-signing secrets (normally automatic right after verifying a device) |
 | `import-keys <pan_user> <file> <passphrase>` | Import E2E key backup |
 | `export-keys <pan_user> <file> <passphrase>` | Export E2E keys |
 

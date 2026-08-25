@@ -158,6 +158,24 @@ pub enum UiToDaemon {
         /// Raw input — either the Base58 recovery key or a passphrase.
         key_input: String,
     },
+
+    /// Ask our other sessions to gossip missing cross-signing secrets (and
+    /// the key-backup decryption key). Normally triggered automatically
+    /// right after a self-verification SAS flow completes; exposed here so
+    /// it can be retried manually (e.g. the other device was offline).
+    RequestMissingSecrets {
+        message_id: String,
+        pan_user: String,
+    },
+
+    /// Create (or replace) this account's cross-signing identity from
+    /// scratch. Only meaningful for an account that has never set up
+    /// cross-signing, or explicitly wants to reset it.
+    BootstrapCrossSigning {
+        message_id: String,
+        pan_user: String,
+        reset: bool,
+    },
 }
 
 impl UiToDaemon {
@@ -178,7 +196,9 @@ impl UiToDaemon {
             | UiToDaemon::AcceptSas { pan_user, .. }
             | UiToDaemon::ContinueKeyShare { pan_user, .. }
             | UiToDaemon::CancelKeyShare { pan_user, .. }
-            | UiToDaemon::RecoverIdentity { pan_user, .. } => pan_user,
+            | UiToDaemon::RecoverIdentity { pan_user, .. }
+            | UiToDaemon::RequestMissingSecrets { pan_user, .. }
+            | UiToDaemon::BootstrapCrossSigning { pan_user, .. } => pan_user,
         }
     }
 
@@ -199,7 +219,9 @@ impl UiToDaemon {
             | UiToDaemon::AcceptSas { message_id, .. }
             | UiToDaemon::ContinueKeyShare { message_id, .. }
             | UiToDaemon::CancelKeyShare { message_id, .. }
-            | UiToDaemon::RecoverIdentity { message_id, .. } => message_id,
+            | UiToDaemon::RecoverIdentity { message_id, .. }
+            | UiToDaemon::RequestMissingSecrets { message_id, .. }
+            | UiToDaemon::BootstrapCrossSigning { message_id, .. } => message_id,
         }
     }
 }

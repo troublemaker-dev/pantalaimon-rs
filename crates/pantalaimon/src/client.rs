@@ -5,9 +5,9 @@ use std::{collections::{BTreeMap, HashMap}, path::{Path, PathBuf}, sync::Arc};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
-    AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, DecryptionSettings,
-    EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, MegolmError,
-    OlmMachine, Sas, TrustRequirement, UserDevices, VerificationRequestState,
+    AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, CrossSigningStatus,
+    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo,
+    MegolmError, OlmMachine, Sas, TrustRequirement, UserDevices, VerificationRequestState,
     decrypt_room_key_export, encrypt_room_key_export,
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
     types::{
@@ -46,7 +46,7 @@ use ruma::{
 };
 use serde::Deserialize;
 use serde_json::{json, value::to_raw_value, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -153,6 +153,11 @@ pub struct PanClient {
     /// Events queued for a room-key re-request after a MissingRoomKey decrypt
     /// failure during `process_sync`; flushed in `run_post_sync_tasks`.
     missing_room_keys: std::sync::Mutex<Vec<(OwnedRoomId, Raw<EncryptedEvent>)>>,
+    /// Serializes `run_post_sync_tasks` — the real `/sync` route spawns it
+    /// fire-and-forget after every sync response, so overlapping syncs (a
+    /// client retry, or a caller that also awaits it directly) can otherwise
+    /// run two invocations concurrently on the same OlmMachine at once.
+    sync_tasks_lock: AsyncMutex<()>,
 }
 
 impl PanClient {
@@ -209,6 +214,7 @@ impl PanClient {
             notified_done: DashMap::new(),
             pending_sends: DashMap::new(),
             missing_room_keys: std::sync::Mutex::new(Vec::new()),
+            sync_tasks_lock: AsyncMutex::new(()),
         })
     }
 
@@ -682,6 +688,7 @@ impl PanClient {
     /// Called from the sync handler in a spawned task so the sync response
     /// is returned to the client before any homeserver round-trips happen.
     pub async fn run_post_sync_tasks(self: std::sync::Arc<Self>) {
+        let _guard = self.sync_tasks_lock.lock().await;
         self.flush_missing_room_key_requests().await;
         self.process_outgoing_requests().await;
         self.check_pending_requests().await;
@@ -1171,6 +1178,19 @@ impl PanClient {
                     Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
                 }
             }
+            UiToDaemon::RequestMissingSecrets { message_id, .. } => {
+                match self.request_missing_secrets().await {
+                    Ok(true) => respond!(message_id, "M_OK", "Requested missing secrets from other sessions"),
+                    Ok(false) => respond!(message_id, "M_OK", "No missing secrets to request"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::BootstrapCrossSigning { message_id, reset, .. } => {
+                match self.do_bootstrap_cross_signing(reset).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Cross-signing identity created and published"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
         }
     }
 
@@ -1321,6 +1341,118 @@ impl PanClient {
             .await?
             .with_context(|| format!("device {device_id} not found for {user_id}"))?;
         device.set_local_trust(trust).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-signing bootstrap (creating a brand-new identity) + UIA
+    // -----------------------------------------------------------------------
+
+    /// Current local cross-signing key material this device has.
+    pub async fn cross_signing_status(&self) -> CrossSigningStatus {
+        self.olm.cross_signing_status().await
+    }
+
+    /// POST `body` to `url`, transparently completing a user-interactive-auth
+    /// (UIA) challenge if the homeserver responds with one and it can be
+    /// satisfied without extra credentials — currently: a flow consisting
+    /// solely of the trivial `m.login.dummy` stage.
+    ///
+    /// `PanClient` only ever holds an access token, never the account
+    /// password (pantalaimon proxies the login request but doesn't retain
+    /// the password afterward), so any flow that actually requires a
+    /// credential stage (`m.login.password`, etc.) can't be completed here.
+    /// That case returns a clear, actionable error instead of a raw 401.
+    async fn post_with_uia(&self, url: &str, mut body: Value) -> Result<Value> {
+        let resp =
+            self.http_client.post(url).bearer_auth(&self.access_token).json(&body).send().await?;
+        if resp.status().as_u16() != 401 {
+            let status = resp.status();
+            let json: Value = resp.json().await.unwrap_or(Value::Null);
+            return if status.is_success() {
+                Ok(json)
+            } else {
+                anyhow::bail!("{status}: {json}")
+            };
+        }
+
+        let challenge: Value = resp.json().await?;
+        let session = challenge
+            .get("session")
+            .and_then(|v| v.as_str())
+            .context("UIA challenge response missing session id")?
+            .to_owned();
+        let flows = challenge.get("flows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+        let dummy_flow = flows.iter().any(|f| {
+            f.get("stages")
+                .and_then(|s| s.as_array())
+                .map(|s| s.len() == 1 && s[0].as_str() == Some("m.login.dummy"))
+                .unwrap_or(false)
+        });
+
+        if !dummy_flow {
+            let stages: Vec<String> = flows
+                .iter()
+                .filter_map(|f| f.get("stages").and_then(|s| s.as_array()))
+                .flat_map(|s| s.iter().filter_map(|v| v.as_str().map(str::to_owned)))
+                .collect();
+            anyhow::bail!(
+                "homeserver requires interactive auth ({}) for this action (session {session}) \
+                 — pantalaimon only holds an access token, not your account password, so it \
+                 can't complete this automatically. Complete it from a client that has your \
+                 credentials, then retry.",
+                stages.join(", ")
+            );
+        }
+
+        body["auth"] = json!({ "type": "m.login.dummy", "session": session });
+        let resp =
+            self.http_client.post(url).bearer_auth(&self.access_token).json(&body).send().await?;
+        let status = resp.status();
+        let json: Value = resp.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            Ok(json)
+        } else {
+            anyhow::bail!("{status}: {json}")
+        }
+    }
+
+    /// Create (or, with `reset`, replace) this account's cross-signing
+    /// identity from scratch. Unlike `request_missing_secrets` (which asks
+    /// for *existing* secrets from another session), this generates brand
+    /// new cross-signing keys locally and publishes them — there is nothing
+    /// to gossip beforehand, so this is only meaningful for an account that
+    /// has never set up cross-signing (or wants to reset it).
+    async fn do_bootstrap_cross_signing(&self, reset: bool) -> Result<()> {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let reqs = self.olm.bootstrap_cross_signing(reset).await?;
+
+        if let Some(upload_keys_req) = &reqs.upload_keys_req {
+            if let AnyOutgoingRequest::KeysUpload(r) = upload_keys_req.request() {
+                self.send_keys_upload(base, &self.access_token, r, upload_keys_req.request_id())
+                    .await?;
+            }
+        }
+
+        let signing_body = json!({
+            "master_key": reqs.upload_signing_keys_req.master_key,
+            "self_signing_key": reqs.upload_signing_keys_req.self_signing_key,
+            "user_signing_key": reqs.upload_signing_keys_req.user_signing_key,
+        });
+        self.post_with_uia(&format!("{base}/_matrix/client/v3/keys/device_signing/upload"), signing_body)
+            .await
+            .context("uploading cross-signing keys")?;
+
+        let sig_body = serde_json::to_value(&reqs.upload_signatures_req.signed_keys)?;
+        self.http_client
+            .post(format!("{base}/_matrix/client/v3/keys/signatures/upload"))
+            .bearer_auth(&self.access_token)
+            .json(&sig_body)
+            .send()
+            .await
+            .context("uploading cross-signing signatures")?;
+
         Ok(())
     }
 
@@ -1655,6 +1787,16 @@ impl PanClient {
                         transaction_id: sas.flow_id().as_str().to_owned(),
                     })
                     .await;
+
+                    // A successful verification means we now mutually trust
+                    // this device — ask it (and any other verified sessions)
+                    // for cross-signing secrets we're missing, the same way
+                    // Element bootstraps a freshly-verified device.
+                    if !sas.is_cancelled() && sas.is_self_verification() {
+                        if let Err(e) = self.request_missing_secrets().await {
+                            warn!("request_missing_secrets after SAS done: {e}");
+                        }
+                    }
                 }
                 to_remove.push((key, sas.flow_id().as_str().to_owned()));
                 continue;
@@ -1690,6 +1832,26 @@ impl PanClient {
             self.notified_done.remove(&key);
             self.notified_invite.remove(&flow_id);
         }
+    }
+
+    /// Ask our other sessions to gossip any cross-signing secrets (and the
+    /// key-backup decryption key) this device is missing, via
+    /// `m.secret.request`/`m.secret.send` to-device messages. A verified
+    /// peer session answers automatically (`receive_sync_changes` already
+    /// handles incoming `m.secret.request`s and queues the reply as a normal
+    /// outgoing to-device request), and an incoming `m.secret.send` is
+    /// imported automatically too — this call only needs to kick off the
+    /// request and flush it.
+    ///
+    /// Returns `true` if a request was actually sent (i.e. something was
+    /// missing and not already requested).
+    async fn request_missing_secrets(&self) -> Result<bool> {
+        let requested = self.olm.query_missing_secrets_from_other_sessions().await?;
+        if requested {
+            info!("requesting missing cross-signing secrets from other sessions");
+            self.process_outgoing_requests().await;
+        }
+        Ok(requested)
     }
 
     /// Dispatch an `OutgoingVerificationRequest` — either a to-device message

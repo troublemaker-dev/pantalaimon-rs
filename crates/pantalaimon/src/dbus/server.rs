@@ -346,6 +346,26 @@ impl ControlIface {
         message_id
     }
 
+    async fn request_missing_secrets(&self, pan_user: String) -> String {
+        let message_id = self.state.next_id();
+        self.state
+            .send(UiToDaemon::RequestMissingSecrets { message_id: message_id.clone(), pan_user })
+            .await;
+        message_id
+    }
+
+    async fn bootstrap_cross_signing(&self, pan_user: String, reset: bool) -> String {
+        let message_id = self.state.next_id();
+        self.state
+            .send(UiToDaemon::BootstrapCrossSigning {
+                message_id: message_id.clone(),
+                pan_user,
+                reset,
+            })
+            .await;
+        message_id
+    }
+
     async fn continue_key_share(
         &self,
         pan_user: String,

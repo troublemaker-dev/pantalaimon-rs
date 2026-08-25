@@ -83,6 +83,8 @@ trait Control {
         pan_user: &str,
         key_input: &str,
     ) -> zbus::Result<String>;
+    async fn request_missing_secrets(&self, pan_user: &str) -> zbus::Result<String>;
+    async fn bootstrap_cross_signing(&self, pan_user: &str, reset: bool) -> zbus::Result<String>;
 }
 
 #[zbus::proxy(
@@ -234,6 +236,26 @@ enum Cmd {
         /// Security key (Base58 recovery key) or passphrase. If omitted, prompts securely (no shell history).
         #[arg(long, short = 'k')]
         key: Option<String>,
+    },
+
+    /// Ask your other sessions to gossip missing cross-signing secrets
+    /// (normally happens automatically right after verifying a device; use
+    /// this to retry if the other device was offline at the time)
+    RequestMissingSecrets {
+        /// Your pantalaimon session user (@you:server)
+        pan_user: String,
+    },
+
+    /// Create (or replace) this account's cross-signing identity from
+    /// scratch. Only needed once per account, for one that has never set up
+    /// cross-signing.
+    BootstrapCrossSigning {
+        /// Your pantalaimon session user (@you:server)
+        pan_user: String,
+        /// Replace an existing cross-signing identity instead of erroring
+        /// if one is already present. This resets trust between all devices.
+        #[arg(long)]
+        reset: bool,
     },
 
     /// Send a blocked message despite unverified devices
@@ -419,6 +441,18 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
             let key_input = read_secret("Security key or passphrase: ", key)?;
             let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.recover_identity(&pan_user, &key_input).await?;
+            wait_response(&mut stream, &mid).await?;
+        }
+
+        Cmd::RequestMissingSecrets { pan_user } => {
+            let mut stream = zbus::MessageStream::from(conn);
+            let mid = ctrl.request_missing_secrets(&pan_user).await?;
+            wait_response(&mut stream, &mid).await?;
+        }
+
+        Cmd::BootstrapCrossSigning { pan_user, reset } => {
+            let mut stream = zbus::MessageStream::from(conn);
+            let mid = ctrl.bootstrap_cross_signing(&pan_user, reset).await?;
             wait_response(&mut stream, &mid).await?;
         }
 

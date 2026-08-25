@@ -51,6 +51,7 @@ pub async fn require_real_homeserver() {
     );
 }
 
+#[derive(Clone)]
 pub struct RegisteredUser {
     pub user_id: String,
     pub device_id: String,

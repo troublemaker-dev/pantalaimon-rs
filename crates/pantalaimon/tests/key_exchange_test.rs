@@ -412,3 +412,169 @@ async fn test_real_unverified_device_send_block_flow() {
         assert_eq!(body["errcode"], "M_FORBIDDEN");
     }
 }
+
+/// Cross-signing secret gossip after self-verification. Device A bootstraps
+/// a brand-new cross-signing identity for the account; device B (a second,
+/// independent session for the *same* account) starts out with none. After
+/// A and B SAS-verify each other, `check_sas_states` should automatically
+/// call `request_missing_secrets()` on B's side (since this is a
+/// self-verification), and B should end up with a complete cross-signing
+/// identity purely from the m.secret.request/m.secret.send round trip — no
+/// recover-identity/SSSS step involved.
+#[tokio::test]
+#[ignore = "requires a real homeserver: ./scripts/testing/homeserver.sh up"]
+async fn test_real_cross_signing_secret_gossip_after_self_verification() {
+    require_real_homeserver().await;
+    let base = homeserver_base_url();
+
+    let user = register_user(&base, "selfverify").await;
+
+    let mut device_a = build_party(&base, false, user.clone()).await;
+    let mut device_b = build_party(&base, false, user.clone()).await;
+
+    let (mut a_since, _) = device_a.sync_and_settle(None).await;
+    let (mut b_since, _) = device_b.sync_and_settle(None).await;
+
+    // Device A bootstraps a brand-new cross-signing identity for the account.
+    device_a
+        .client()
+        .handle_ui_command(UiToDaemon::BootstrapCrossSigning {
+            message_id: "bootstrap".into(),
+            pan_user: device_a.user.user_id.clone(),
+            reset: false,
+        })
+        .await;
+    let a_status = device_a.client().cross_signing_status().await;
+    assert!(a_status.is_complete(), "device A must have a complete cross-signing identity after bootstrap");
+    let b_status = device_b.client().cross_signing_status().await;
+    assert!(!b_status.is_complete(), "device B must start out without cross-signing secrets");
+
+    let a_uid = device_a.user.user_id.clone();
+    let a_did = device_a.user.device_id.clone();
+    let b_uid = device_b.user.user_id.clone();
+    let b_did = device_b.user.device_id.clone();
+
+    // Let device B discover device A's freshly-uploaded device before
+    // starting SAS — same reason as in test_real_sas_verification_round_trip.
+    let (next, _) = device_a.sync_and_settle(a_since.as_deref()).await;
+    a_since = next;
+    let (next, _) = device_b.sync_and_settle(b_since.as_deref()).await;
+    b_since = next;
+    device_b.client().list_user_devices(&a_uid).await;
+
+    device_a
+        .client()
+        .handle_ui_command(UiToDaemon::StartSas {
+            message_id: "sas-start".into(),
+            pan_user: a_uid.clone(),
+            user_id: b_uid.clone(),
+            device_id: b_did.clone(),
+        })
+        .await;
+
+    let mut saw_invite = false;
+    for _ in 0..MAX_ROUNDS {
+        let (next, _) = device_b.sync_and_settle(b_since.as_deref()).await;
+        b_since = next;
+        if drain_signals(&mut device_b.ui_rx).iter().any(|e| {
+            matches!(e, DaemonToUi::SasInvite { user_id, device_id, .. } if user_id == &a_uid && device_id == &a_did)
+        }) {
+            saw_invite = true;
+            break;
+        }
+        tokio::time::sleep(ROUND_DELAY).await;
+    }
+    assert!(saw_invite, "device B must see device A's SasInvite");
+
+    device_b
+        .client()
+        .handle_ui_command(UiToDaemon::AcceptSas {
+            message_id: "sas-accept".into(),
+            pan_user: b_uid.clone(),
+            user_id: a_uid.clone(),
+            device_id: a_did.clone(),
+        })
+        .await;
+
+    let mut a_emoji = None;
+    let mut b_emoji = None;
+    for _ in 0..MAX_ROUNDS {
+        let (next, _) = device_a.sync_and_settle(a_since.as_deref()).await;
+        a_since = next;
+        let (next, _) = device_b.sync_and_settle(b_since.as_deref()).await;
+        b_since = next;
+
+        for e in drain_signals(&mut device_a.ui_rx) {
+            if let DaemonToUi::SasShow { emoji, .. } = e {
+                a_emoji = Some(emoji);
+            }
+        }
+        for e in drain_signals(&mut device_b.ui_rx) {
+            if let DaemonToUi::SasShow { emoji, .. } = e {
+                b_emoji = Some(emoji);
+            }
+        }
+        if a_emoji.is_some() && b_emoji.is_some() {
+            break;
+        }
+        tokio::time::sleep(ROUND_DELAY).await;
+    }
+    let a_emoji = a_emoji.expect("device A must see SasShow with emoji");
+    let b_emoji = b_emoji.expect("device B must see SasShow with emoji");
+    assert_eq!(a_emoji, b_emoji, "both sides must compute the same emoji sequence");
+
+    device_a
+        .client()
+        .handle_ui_command(UiToDaemon::ConfirmSas {
+            message_id: "sas-confirm-a".into(),
+            pan_user: a_uid.clone(),
+            user_id: b_uid.clone(),
+            device_id: b_did.clone(),
+        })
+        .await;
+    device_b
+        .client()
+        .handle_ui_command(UiToDaemon::ConfirmSas {
+            message_id: "sas-confirm-b".into(),
+            pan_user: b_uid.clone(),
+            user_id: a_uid.clone(),
+            device_id: a_did.clone(),
+        })
+        .await;
+
+    // Keep syncing past SasDone: that's also when the auto-triggered
+    // request_missing_secrets() fires on device B (is_self_verification()
+    // is true for both sides here), and the actual gossip needs a couple
+    // more round trips to land — device B's request out, device A's
+    // auto-response out, device B importing it.
+    let mut a_done = false;
+    let mut b_done = false;
+    let mut b_complete = false;
+    for _ in 0..MAX_ROUNDS * 2 {
+        let (next, _) = device_a.sync_and_settle(a_since.as_deref()).await;
+        a_since = next;
+        let (next, _) = device_b.sync_and_settle(b_since.as_deref()).await;
+        b_since = next;
+
+        if drain_signals(&mut device_a.ui_rx).iter().any(|e| matches!(e, DaemonToUi::SasDone { .. })) {
+            a_done = true;
+        }
+        if drain_signals(&mut device_b.ui_rx).iter().any(|e| matches!(e, DaemonToUi::SasDone { .. })) {
+            b_done = true;
+        }
+
+        if a_done && b_done && device_b.client().cross_signing_status().await.is_complete() {
+            b_complete = true;
+            break;
+        }
+        tokio::time::sleep(ROUND_DELAY).await;
+    }
+    let _ = a_since;
+    let _ = b_since;
+
+    assert!(a_done && b_done, "SAS verification must complete on both sides");
+    assert!(
+        b_complete,
+        "device B must automatically receive device A's cross-signing secrets after self-verification"
+    );
+}

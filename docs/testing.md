@@ -30,25 +30,27 @@ drive real HTTP traffic between them — real `keys/upload`, `keys/query`,
 `keys/claim`, and to-device delivery — so the actual crypto handshake is
 exercised end to end, not mocked.
 
-Three scenarios are covered:
+Four scenarios are covered:
 
 | Test | What it proves |
 |---|---|
 | `test_real_key_exchange_encrypt_decrypt_roundtrip` | Alice sends a real Megolm-encrypted message; bob's independent OlmMachine actually decrypts it after a real to-device room-key relay. |
 | `test_real_sas_verification_round_trip` | Full emoji SAS verification round trip (`StartSas` → `AcceptSas` → matching emoji → `ConfirmSas` → `SasDone` on both sides), driven via `PanClient::handle_ui_command` — the same function `message_router`/D-Bus calls in production, just without the D-Bus transport. |
 | `test_real_unverified_device_send_block_flow` | A send into a room with an unverified device blocks, emits `UnverifiedDevices`, and only proceeds/cancels once `SendAnyways`/`CancelSending` arrives — the code path fixed by "Fix silent failures in the unverified-device send-block flow". |
+| `test_real_cross_signing_secret_gossip_after_self_verification` | A second session for the same account starts with no cross-signing secrets; after SAS-verifying it against a session that already has them, `request_missing_secrets()` fires automatically and the secrets arrive purely via `m.secret.request`/`m.secret.send` — no SSSS/recovery-key step. |
 
 They are `#[ignore]`d, so plain `cargo test` never touches the network.
 Run them explicitly:
 
 ```bash
 ./scripts/testing/homeserver.sh up
-cargo test --test key_exchange_test -- --ignored --test-threads=1 <test-name>
+cargo test --test key_exchange_test -- --ignored --test-threads=1
 ./scripts/testing/homeserver.sh down
 ```
 
-**Run one test at a time** (pass its name as shown above). See
-[Known limitations](#known-limitations) below for why.
+All four run together in one process reliably (a few seconds total) — see
+the note in [Known limitations](#known-limitations) about a concurrency bug
+that used to make this flaky and is now fixed.
 
 These tests are **not wired into CI** yet — they're a local/manual dev tool
 for now. CI wiring can follow once the harness has proven stable across
@@ -127,23 +129,22 @@ elsewhere (e.g. you started it yourself, outside this script).
 
 ### Known limitations
 
-- **Run real-homeserver tests one at a time.** While building this harness,
-  running multiple `#[ignore]`d tests together in one `cargo test`
-  invocation (e.g. the plain `cargo test --test key_exchange_test --
-  --ignored`, no name filter) was repeatedly observed to hang indefinitely
-  on the *second* test's HTTP calls — specifically against Apple's
-  `container` runtime, and specifically only when more than one test ran in
-  the same process. Every individual test passes reliably and quickly
-  (under ~1.5s) on its own, including immediately after a full
-  `container system stop && container system start`. The cause wasn't
-  pinned down after ruling out connection-pool reuse, stale volume state,
-  and registered-user count — it did not reproduce when each test was
-  invoked as its own separate `cargo test` process. If you hit a hang,
-  kill it and retry with a single test-name filter; if it's still flaky,
-  restart the container system (`container system stop && container
-  system start`) or fully recreate the homeserver (`./scripts/testing/homeserver.sh down --wipe && ./scripts/testing/homeserver.sh up`).
-  This hasn't been characterized on Docker/Podman — if you need to run the
-  full suite unattended (e.g. in CI down the line), try one of those first.
+- **(Fixed) Concurrent `run_post_sync_tasks` could hang.** Earlier versions
+  of this harness hit a real, reproducible hang whenever more than one real
+  sync round happened close together in the same process — traced to
+  `routes.rs`'s `/sync` handler unconditionally doing
+  `tokio::spawn(client.clone().run_post_sync_tasks())` fire-and-forget on
+  every response, while this harness's `sync_and_settle` *also* awaits
+  `run_post_sync_tasks()` directly (deliberately — see the comment on that
+  method — to avoid racing the spawn). The two invocations could run
+  concurrently on the same `PanClient`, and something in that overlap (most
+  likely duplicate in-flight requests, e.g. two concurrent
+  `keys/signatures/upload` calls) would stall. Fixed in `client.rs` by
+  serializing `run_post_sync_tasks` behind a per-client `tokio::sync::Mutex`
+  (`sync_tasks_lock`) — a legitimate production robustness fix, not just a
+  test workaround, since nothing previously prevented two overlapping syncs
+  from racing there in real deployments either. All four tests now run
+  together in one process repeatedly and reliably.
 - Tests register fresh, uniquely-named users (`<prefix>-<pid>-<timestamp>-<n>`)
   on every run, so it's safe to run them repeatedly against the same
   persistent volume without wiping — no manual cleanup needed between runs.
