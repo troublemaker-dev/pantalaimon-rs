@@ -38,7 +38,7 @@ use ruma::{
         secret_storage::{
             default_key::SecretStorageDefaultKeyEventContent,
             key::SecretStorageKeyEventContent,
-            secret::SecretEventContent,
+            secret::{SecretEncryptedData, SecretEventContent},
         },
     },
     serde::Raw,
@@ -563,7 +563,11 @@ impl PanClient {
             .olm
             .encrypt_room_event_raw(&ruma_room_id, event_type, &raw_content)
             .await?;
-        let encrypted_value = serde_json::to_value(&encrypted)?;
+        // `encrypt_room_event_raw` bundles the actual encrypted event content
+        // together with local `encryption_info` about the operation we just
+        // performed (our own device/session info) — only `content` is the
+        // wire event body; `encryption_info` is never sent to the homeserver.
+        let encrypted_value = serde_json::to_value(&encrypted.content)?;
 
         Ok(SendOutcome::Encrypted {
             event_type: "m.room.encrypted".to_owned(),
@@ -1610,9 +1614,8 @@ impl PanClient {
             .get(key_id)
             .with_context(|| format!("{type_str} is not encrypted with key {key_id}"))?;
 
-        let encrypted_data: AesHmacSha2EncryptedData = encrypted
-            .clone()
-            .try_into()
+        let encrypted_data: AesHmacSha2EncryptedData = SecretEncryptedData::deserialize_as_aes_hmac_sha2(encrypted)
+            .and_then(TryInto::try_into)
             .map_err(|e: serde_json::Error| {
                 anyhow::anyhow!("Invalid encrypted payload for {type_str}: {e}")
             })?;

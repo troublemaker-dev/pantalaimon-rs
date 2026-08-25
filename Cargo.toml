@@ -34,6 +34,6 @@ url = { version = "2", features = ["serde"] }
 indexmap = "2"
 clap_mangen = "0.2"
 rpassword = "7"
-matrix-sdk-crypto = { version = "0.16.1", features = ["automatic-room-key-forwarding"] }
-matrix-sdk-sqlite = { version = "0.16", features = ["crypto-store"] }
-ruma = { version = "0.14", features = ["client-api-c"] }
+matrix-sdk-crypto = { version = "0.18.0", features = ["automatic-room-key-forwarding"] }
+matrix-sdk-sqlite = { version = "0.18.0", features = ["crypto-store"] }
+ruma = { version = "0.16.0", features = ["client-api-c"] }
